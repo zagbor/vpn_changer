@@ -197,6 +197,41 @@ export class KeeneticClient {
     }
   }
 
+  // setGlobalPriority marks an interface as a global (internet) provider at a
+  // given priority. Lower priority number = higher route preference among the
+  // router's "Connection priorities" (failover/balance). order is the tie-break.
+  async setGlobalPriority(id: string, priority: number, order: number): Promise<void> {
+    const { data, status } = await this.do(
+      "POST",
+      `/rci/interface/${id}`,
+      { ip: { global: { priority, order } } },
+      "application/json"
+    );
+    if (status < 200 || status > 299) {
+      throw new Error(`Set priority on ${id} failed (status ${status}): ${JSON.stringify(data)}`);
+    }
+    this.checkError(data);
+    try {
+      await this.do("POST", "/rci/", [{ parse: "system configuration save" }], "application/json");
+    } catch {
+      // saving is optional
+    }
+  }
+
+  // runCLI executes an NDMS CLI command via /rci/ and returns the raw response.
+  async runCLI(cmd: string): Promise<any> {
+    const { data, status } = await this.do(
+      "POST",
+      "/rci/",
+      [{ parse: cmd }],
+      "application/json"
+    );
+    if (status < 200 || status > 299) {
+      throw new Error(`CLI '${cmd}' failed (status ${status})`);
+    }
+    return data;
+  }
+
   // wireGuardInterfaceIDs returns just the IDs of all WireGuard interfaces.
   async wireGuardInterfaceIDs(): Promise<string[]> {
     const ifaces = await this.showWireGuardInterfaces();

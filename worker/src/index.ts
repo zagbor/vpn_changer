@@ -207,14 +207,38 @@ async function diagWire(chatId: number, arg: string, store: Store, env: Env): Pr
     return;
   }
   const c = new KeeneticClient(bd.url, bd.login, bd.password);
-  let out = `Диагностика ${bd.name} (хвост /rci/interface):\n`;
+  let out = `Диагностика ${bd.name}:\n`;
+
+  // Show WireGuard interfaces and their global (internet) priority.
+  try {
+    const ifaces = await c.showWireGuardInterfaces();
+    out += `WireGuard интерфейсы (${ifaces.length}): ${ifaces.map((i) => i.id).join(", ") || "—"}\n`;
+  } catch (e: any) {
+    out += `\nWireGuard интерфейсы → ERR ${e.message}\n`;
+  }
+
   try {
     const body = await c.rawGet("/rci/interface");
-    out += `(всего ${body.length} chars)\n...${body.slice(-3400)}\n`;
+    const parsed = JSON.parse(body) as Record<string, any>;
+    for (const [id, obj] of Object.entries(parsed)) {
+      if (!String(id).toLowerCase().startsWith("wireguard")) continue;
+      const g = obj?.ip?.global;
+      out += `\n${id}: up=${!!obj?.up} global-priority=${g?.priority ?? "не задан"} order=${g?.order ?? "—"}\n`;
+    }
   } catch (e: any) {
-    out += `\nGET /rci/interface → ERR ${e.message}\n`;
+    out += `\n(прочитать /rci/interface: ${e.message})\n`;
   }
+
+  try {
+    const data = await c.runCLI("show ip route");
+    const route = JSON.stringify(data).slice(0, 1500);
+    out += `\n### show ip route ###\n${route}\n`;
+  } catch (e: any) {
+    out += `\n### show ip route → ERR ${e.message}###\n`;
+  }
+
   await sendMessage(env.TG_BOT_TOKEN, chatId, out);
+  out = "";
 }
 
 async function handleBindStep(
@@ -469,7 +493,14 @@ async function applyConf(
     await c.setInterfaceEnabled(newId, true);
     bd.interface_id = newId;
     await store.update(bd);
-    await sendMessage(env.TG_BOT_TOKEN, chatId, `Конфигурация WireGuard на ${bd.name} включена (интерфейс ${newId}). Старых конфигов очищено: ${removed}.`);
+    // Make VPN the primary internet interface; Ethernet stays as fallback.
+    try {
+      await c.setGlobalPriority(newId, 10, 0);
+    } catch (e: any) {
+      await sendMessage(env.TG_BOT_TOKEN, chatId, `VPN включён (${newId}), но не удалось сделать его основным интернет-подключением: ` + e.message);
+      return;
+    }
+    await sendMessage(env.TG_BOT_TOKEN, chatId, `Конфигурация WireGuard на ${bd.name} включена (интерфейс ${newId}) и назначена основным интернет-подключением (Ethernet — резерв). Старых конфигов очищено: ${removed}.`);
   } catch (e: any) {
     await sendMessage(env.TG_BOT_TOKEN, chatId, `Конфигурация загружена, но не удалось включить интерфейс: ` + e.message);
   }
