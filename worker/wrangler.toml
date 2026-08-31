@@ -1,0 +1,10 @@
+name = "vpn-changer-bot"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[vars]
+TLSSKIPVERIFY = "1"
+
+[[kv_namespaces]]
+binding = "STATE"
+id = "0caf2e3d754e4336ad89e4efe6eabedc"
