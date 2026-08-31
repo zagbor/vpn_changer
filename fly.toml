@@ -1,0 +1,14 @@
+app = "vpn-changer-bot"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  TLSSKIPVERIFY = "1"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1

@@ -1,0 +1,15 @@
+services:
+  vpn-changer-bot:
+    build: .
+    container_name: vpn-changer-bot
+    restart: unless-stopped
+    environment:
+      TG_BOT_TOKEN: "${TG_BOT_TOKEN:?set the bot token in .env}"
+      # Set to "1" to skip TLS verification of self-signed Keenetic certificates
+      TLSSKIPVERIFY: "${TLSSKIPVERIFY:-1}"
+      # Optional allowlist of Telegram chat IDs allowed to use the bot
+      TG_ALLOWED_IDS: "${TG_ALLOWED_IDS:-}"
+      # Optional full-admin chat IDs — can manage ALL users' routers
+      TG_ADMIN_IDS: "${TG_ADMIN_IDS:-}"
+    volumes:
+      - ./data:/app/data
