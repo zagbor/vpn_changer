@@ -43,6 +43,41 @@ export async function sendMessage(
   console.log("sendMessage", chatId, "ok:", res?.ok, "desc:", res?.description);
 }
 
+interface InlineButton {
+  text: string;
+  callback_data: string;
+}
+
+// sendInlineKeyboard sends a message with a row of inline buttons.
+export async function sendInlineKeyboard(
+  token: string,
+  chatId: number,
+  text: string,
+  buttons: InlineButton[]
+): Promise<void> {
+  const keyboard = {
+    inline_keyboard: buttons.map((b) => [b]),
+  };
+  const res = await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    text,
+    reply_markup: keyboard,
+  });
+  console.log("sendInlineKeyboard", chatId, "ok:", res?.ok, "desc:", res?.description);
+}
+
+// answerCallbackQuery acknowledges a button press (clears the spinner).
+export async function answerCallbackQuery(
+  token: string,
+  callbackQueryId: string,
+  text?: string
+): Promise<void> {
+  await tgRequest(token, "answerCallbackQuery", {
+    callback_query_id: callbackQueryId,
+    text,
+  });
+}
+
 export async function getFileDirectURL(
   token: string,
   fileId: string

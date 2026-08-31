@@ -1,11 +1,29 @@
 import { KeeneticClient } from "./keenetic.js";
-import { sendMessage, downloadTelegramFile, splitCmd, type TelegramMessage } from "./telegram.js";
+import { sendMessage, sendInlineKeyboard, answerCallbackQuery, downloadTelegramFile, splitCmd, type TelegramMessage } from "./telegram.js";
 import { Store } from "./store.js";
 import type { Env, Binding } from "./types.js";
 
 const NAME_RE = /^[A-Za-z0-9_\-]{1,32}$/;
+const CRLF = "\n";
 
 export default {
+  // Scheduled (cron) handler: daily heartbeat to the bot operator.
+  async scheduled(_event: any, env: Env, _ctx: any): Promise<void> {
+    const adminChat = env.ADMIN_LOG_CHAT;
+    if (!adminChat || !env.TG_BOT_TOKEN) return;
+    const now = new Date();
+    const ts = now.toISOString().replace("T", " ").slice(0, 16);
+    try {
+      await sendMessage(
+        env.TG_BOT_TOKEN,
+        adminChat,
+        `✅ Бот жив и работает.\nВремя (UTC): ${ts}`
+      );
+    } catch (e: any) {
+      console.error("heartbeat failed:", e?.message || e);
+    }
+  },
+
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
@@ -16,16 +34,25 @@ export default {
     if (url.pathname === "/webhook" && request.method === "POST") {
       const body = await request.text();
       console.log("webhook received:", body);
+      let errMsg: TelegramMessage | undefined;
       try {
         const update = JSON.parse(body);
         const msg = update?.message;
+        const cq = update?.callback_query;
         if (msg) {
+          errMsg = msg;
           console.log("processing message from chat", msg.chat?.id);
           await handleMessage(msg, env);
           console.log("finished message", msg.chat?.id);
+        } else if (cq && cq.message && cq.message.chat) {
+          errMsg = cq.message;
+          console.log("processing callback from chat", cq.message.chat.id);
+          await handleCallback(cq, env);
+          console.log("finished callback", cq.message.chat.id);
         }
       } catch (e: any) {
         console.error("webhook error:", e?.message || e);
+        await notifyAdmin(env, errMsg, e);
       }
       return new Response("ok");
     }
@@ -43,7 +70,7 @@ export default {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             url: webhookUrl,
-            allowed_updates: ["message"],
+            allowed_updates: ["message", "callback_query"],
           }),
         }
       );
@@ -84,26 +111,63 @@ function isAllowed(env: Env, chatId: number): boolean {
   return env.TG_ALLOWED_IDS.split(",").map((s) => s.trim()).includes(String(chatId));
 }
 
+// notifyAdmin sends an error/event log to the bot operator's Telegram chat.
+// msg identifies which user/chat triggered the event so the operator knows
+// who the error came from.
+async function notifyAdmin(env: Env, msg: TelegramMessage | undefined, err: unknown): Promise<void> {
+  const adminChat = env.ADMIN_LOG_CHAT;
+  if (!adminChat || !env.TG_BOT_TOKEN) return;
+
+  const who = msg
+    ? `пользователь: ${msg.chat?.id}${msg.chat?.type ? " (" + msg.chat.type + ")" : ""}`
+    : "пользователь: неизвестен";
+  const what =
+    msg?.text != null
+      ? `сообщение: ${msg.text.slice(0, 200)}`
+      : msg?.document?.file_name
+      ? `файл: ${msg.document.file_name}`
+      : "";
+
+  let errText = "";
+  if (err instanceof Error) {
+    errText = err.message;
+  } else {
+    try {
+      errText = JSON.stringify(err);
+    } catch {
+      errText = String(err);
+    }
+  }
+
+  const log = [
+    "⚠️ Ошибка бота:",
+    who,
+    what,
+    `ошибка: ${errText.slice(0, 600)}`,
+  ].filter(Boolean).join(CRLF);
+
+  try {
+    await sendMessage(env.TG_BOT_TOKEN, adminChat, log);
+  } catch {
+    // never let logging break message handling
+  }
+}
+
 function helpText(): string {
   return [
     "VPN Changer — замена WireGuard на роутере Keenetic через Telegram.",
     "",
     "Один бот — много роутеров; каждый пользователь управляет своим.",
     "",
-    "Команды:",
-    "/bind — привязать роутер (URL, логин, пароль, имя, интерфейс)",
+    "Используйте /start, чтобы открыть меню с кнопками, или команды:",
+    "/bind — привязать роутер",
     "/routers — список ваших роутеров",
-    "/setiface <имя> <id> — сменить заменяемый интерфейс (- = импорт нового)",
-    "/status [имя] — проверить связь с роутером",
-    "/unbind <имя> — отвязать роутер",
+    "/select — выбрать роутер для следующего .conf",
+    "/status — проверить связь с роутером",
+    "/unbind — отвязать роутер",
     "",
-    "Смена VPN: просто отправьте WireGuard .conf файл.",
-    "Если несколько роутеров — укажите имя в подписи к файлу.",
+    "Смена VPN: выберите роутер (/select), затем отправьте WireGuard .conf файл.",
     "",
-    "Для администраторов:",
-    "/admin_routers — все роутеры всех пользователей",
-    "/admin_status <ownerId> <имя> — проверить чужой роутер",
-    "/admin_unbind <ownerId> <имя> — отвязать чужой роутер",
   ].join("\n");
 }
 
@@ -138,7 +202,8 @@ async function handleMessage(msg: TelegramMessage, env: Env): Promise<void> {
   switch (cmd) {
     case "/start":
     case "/help":
-      await sendMessage(env.TG_BOT_TOKEN, chatId, helpText());
+    case "/menu":
+      await showMainMenu(chatId, env);
       break;
 
     case "/bind":
@@ -150,6 +215,10 @@ async function handleMessage(msg: TelegramMessage, env: Env): Promise<void> {
       await listRouters(chatId, store, env);
       break;
 
+    case "/select":
+      await selectRouter(chatId, store, env);
+      break;
+
     case "/status":
       await status(chatId, arg, store, env);
       break;
@@ -159,12 +228,7 @@ async function handleMessage(msg: TelegramMessage, env: Env): Promise<void> {
         await sendMessage(env.TG_BOT_TOKEN, chatId, "Укажите имя: /unbind <имя>");
         return;
       }
-      try {
-        await store.remove(chatId, arg);
-        await sendMessage(env.TG_BOT_TOKEN, chatId, `Роутер ${arg} удалён.`);
-      } catch (e: any) {
-        await sendMessage(env.TG_BOT_TOKEN, chatId, "Ошибка: " + e.message);
-      }
+      await unbind(chatId, arg, store, env);
       break;
 
     case "/setiface":
@@ -361,8 +425,246 @@ async function listRouters(chatId: number, store: Store, env: Env): Promise<void
     const target = r.interface_id || "первый WireGuard интерфейс";
     reply += ` - ${r.name} — ${r.url} (цель: ${target})\n`;
   }
-  reply += "\nОтправьте .conf, чтобы заменить VPN. При нескольких роутерах укажите имя в подписи.";
+  reply += "\nВыберите роутер кнопкой (/select) для отправки .conf, или нажмите кнопки ниже для действий.";
+  const buttons = list.map((r) => ({
+    text: r.name,
+    callback_data: `pick:select:${r.name}`,
+  }));
   await sendMessage(env.TG_BOT_TOKEN, chatId, reply);
+  if (buttons.length > 0) {
+    buttons.push({ text: "🏠 В начало", callback_data: "nav:main" });
+    await sendInlineKeyboard(env.TG_BOT_TOKEN, chatId, "Действия по роутерам:", buttons);
+  }
+}
+
+// selectRouter asks the user which of their routers should receive the next .conf.
+async function selectRouter(chatId: number, store: Store, env: Env): Promise<void> {
+  await pickRouterList(chatId, store, env, "select");
+}
+
+// showMainMenu renders the top-level button menu.
+async function showMainMenu(chatId: number, env: Env): Promise<void> {
+  const buttons = [
+    { text: "📡 Привязать роутер", callback_data: "nav:bind" },
+    { text: "🖥 Выбрать роутер (.conf)", callback_data: "nav:select" },
+    { text: "📊 Статус роутера", callback_data: "nav:status" },
+    { text: "📋 Список роутеров", callback_data: "nav:list" },
+    { text: "🗑 Отвязать роутер", callback_data: "nav:remove" },
+    { text: "🧹 Удалить конфиги с роутера", callback_data: "nav:wipe" },
+    { text: "🆘 Помощь", callback_data: "nav:help" },
+  ];
+  await sendInlineKeyboard(
+    env.TG_BOT_TOKEN,
+    chatId,
+    "Главное меню VPN Changer. Выберите действие:",
+    buttons
+  );
+}
+
+// pickRouterList shows the user's routers as buttons for a given action.
+// action: "select" | "status" | "remove" | "wipe"
+async function pickRouterList(chatId: number, store: Store, env: Env, action: string): Promise<void> {
+  const list = await store.list(chatId);
+  if (list.length === 0) {
+    await sendMessage(env.TG_BOT_TOKEN, chatId, "Роутеры не привязаны. Используйте «Привязать роутер».");
+    return;
+  }
+  const labels: Record<string, string> = {
+    select: "Выберите роутер, которому отправить следующий .conf:",
+    status: "Выберите роутер для проверки:",
+    remove: "Выберите роутер для отвязки:",
+    wipe: "Выберите роутер, с которого удалить ВСЕ WireGuard-конфиги:",
+  };
+  const buttons = list.map((r) => ({
+    text: r.name,
+    callback_data: `pick:${action}:${r.name}`,
+  }));
+  buttons.push({ text: "🏠 В начало", callback_data: "nav:main" });
+  await sendInlineKeyboard(env.TG_BOT_TOKEN, chatId, labels[action] || "Выберите роутер:", buttons);
+}
+
+// handleCallback processes all inline-button presses (menu & router actions).
+interface CallbackQuery {
+  id: string;
+  from: { id: number };
+  message: TelegramMessage;
+  data?: string;
+}
+
+async function handleCallback(cq: CallbackQuery, env: Env): Promise<void> {
+  const chatId = cq.message.chat.id;
+  const data = cq.data || "";
+  const store = new Store(env.STATE);
+
+  try {
+    if (data.startsWith("nav:")) {
+      const nav = data.slice(4);
+      switch (nav) {
+        case "main":
+          await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id);
+          try {
+            await store.deleteBindState(chatId);
+          } catch {
+            // no bind state
+          }
+          await showMainMenu(chatId, env);
+          break;
+        case "bind":
+          await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id, "Начинаю привязку");
+          await store.setBindState(chatId, { step: 0 });
+          await sendInlineKeyboard(
+            env.TG_BOT_TOKEN,
+            chatId,
+            "Привязка роутера.\n\nШаг 1/5: введите адрес роутера.\nНапример: https://ваш-ник.keenetic.link или https://192.168.1.1",
+            [{ text: "🏠 В начало", callback_data: "nav:main" }]
+          );
+          break;
+        case "select":
+          await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id);
+          await pickRouterList(chatId, store, env, "select");
+          break;
+        case "status":
+          await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id);
+          await pickRouterList(chatId, store, env, "status");
+          break;
+        case "list":
+          await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id);
+          await listRouters(chatId, store, env);
+          break;
+        case "remove":
+          await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id);
+          await pickRouterList(chatId, store, env, "remove");
+          break;
+        case "wipe":
+          await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id);
+          await pickRouterList(chatId, store, env, "wipe");
+          break;
+        case "help":
+          await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id);
+          await sendInlineKeyboard(
+            env.TG_BOT_TOKEN,
+            chatId,
+            helpText(),
+            [{ text: "🏠 В начало", callback_data: "nav:main" }]
+          );
+          break;
+        default:
+          await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id, "Неизвестная команда");
+      }
+      return;
+    }
+
+    if (data.startsWith("pick:")) {
+      const parts = data.split(":");
+      const action = parts[1];
+      const name = parts.slice(2).join(":");
+      await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id);
+      if (action === "select") {
+        await store.get(chatId, name);
+        await store.setSelected(chatId, name);
+        await sendMessage(env.TG_BOT_TOKEN, chatId, `Роутер ${name} выбран. Отправьте WireGuard .conf — он будет применён именно к нему.`);
+      } else if (action === "status") {
+        await status(chatId, name, store, env);
+      } else if (action === "remove") {
+        // show confirmation step
+        const buttons = [
+          { text: "Да, отвязать", callback_data: `del:${name}` },
+          { text: "🏠 В начало", callback_data: "nav:main" },
+        ];
+        await sendInlineKeyboard(
+          env.TG_BOT_TOKEN,
+          chatId,
+          `Отвязать роутер «${name}»? Это действие нельзя отменить.`,
+          buttons
+        );
+      } else if (action === "wipe") {
+        const buttons = [
+          { text: "Да, удалить все конфиги", callback_data: `dowipe:${name}` },
+          { text: "🏠 В начало", callback_data: "nav:main" },
+        ];
+        await sendInlineKeyboard(
+          env.TG_BOT_TOKEN,
+          chatId,
+          `Удалить ВСЕ WireGuard-конфиги с роутера «${name}»? VPN будет снят с приоритета, интернет вернётся на Ethernet.`,
+          buttons
+        );
+      }
+      return;
+    }
+
+    if (data.startsWith("del:")) {
+      const name = data.slice(4);
+      await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id, `Отвязываю ${name}`);
+      await unbind(chatId, name, store, env);
+      return;
+    }
+
+    if (data.startsWith("dowipe:")) {
+      const name = data.slice(7);
+      await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id, `Очищаю ${name}`);
+      await wipeConfigs(chatId, name, store, env);
+      return;
+    }
+
+    await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id, "Неизвестная кнопка");
+  } catch (e: any) {
+    await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id, "Ошибка: " + (e?.message || e));
+  }
+}
+
+async function unbind(chatId: number, name: string, store: Store, env: Env): Promise<void> {
+  try {
+    await store.remove(chatId, name);
+    await sendMessage(env.TG_BOT_TOKEN, chatId, `Роутер ${name} удалён.`);
+  } catch (e: any) {
+    await sendMessage(env.TG_BOT_TOKEN, chatId, "Ошибка: " + e.message);
+  }
+}
+
+// wipeConfigs deletes every WireGuard config on the router. Deleting the
+// interfaces also removes their ip.global.priority, so internet returns to
+// the Ethernet provider automatically.
+async function wipeConfigs(chatId: number, name: string, store: Store, env: Env): Promise<void> {
+  let bd: Binding;
+  try {
+    bd = await store.get(chatId, name);
+  } catch (e: any) {
+    await sendMessage(env.TG_BOT_TOKEN, chatId, e.message);
+    return;
+  }
+
+  const c = new KeeneticClient(bd.url, bd.login, bd.password);
+  const alive = await c.ping();
+  if (!alive) {
+    await sendMessage(env.TG_BOT_TOKEN, chatId, "Роутер недоступен.");
+    return;
+  }
+  try {
+    await c.auth();
+  } catch (e: any) {
+    await sendMessage(env.TG_BOT_TOKEN, chatId, "Ошибка авторизации: " + e.message);
+    return;
+  }
+
+  await sendMessage(env.TG_BOT_TOKEN, chatId, `Очищаю WireGuard-конфиги на роутере ${name}...`);
+  try {
+    const removed = await c.deleteAllWireGuard();
+    if (bd.interface_id) {
+      bd.interface_id = "";
+      try {
+        await store.update(bd);
+      } catch {
+        // router binding may be unchanged; ignore
+      }
+    }
+    await sendMessage(
+      env.TG_BOT_TOKEN,
+      chatId,
+      `С роутера ${name} удалено конфигов: ${removed}. VPN снят, интернет вернётся на Ethernet.`
+    );
+  } catch (e: any) {
+    await sendMessage(env.TG_BOT_TOKEN, chatId, "Не удалось удалить конфиги: " + e.message);
+  }
 }
 
 async function status(chatId: number, arg: string, store: Store, env: Env): Promise<void> {
@@ -414,7 +716,7 @@ async function handleDocument(
     return;
   }
 
-  const name = (msg.caption || "").trim();
+  const name = (msg.caption || "").trim() || (await store.getSelected(chatId)) || "";
 
   let bd: Binding;
   try {
@@ -422,6 +724,13 @@ async function handleDocument(
   } catch (e: any) {
     await sendMessage(env.TG_BOT_TOKEN, chatId, e.message);
     return;
+  }
+
+  // If a router was chosen via /select button, consume that selection.
+  try {
+    await store.deleteSelected(chatId);
+  } catch {
+    // ignore cleanup failures
   }
 
   let conf: string;

@@ -8,7 +8,11 @@ export class KeeneticClient {
   private cookie = "";
 
   constructor(baseURL: string, login: string, pass: string) {
-    this.baseURL = baseURL.replace(/\/+$/, "");
+    let url = (baseURL || "").trim();
+    if (!/^https?:\/\//i.test(url)) {
+      url = "https://" + url.replace(/^\/+/, "");
+    }
+    this.baseURL = url.replace(/\/+$/, "");
     this.login = login;
     this.pass = pass;
   }

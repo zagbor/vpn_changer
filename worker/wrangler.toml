@@ -4,7 +4,12 @@ compatibility_date = "2024-12-01"
 
 [vars]
 TLSSKIPVERIFY = "1"
+ADMIN_LOG_CHAT = 934012
 
 [[kv_namespaces]]
 binding = "STATE"
 id = "0caf2e3d754e4336ad89e4efe6eabedc"
+
+# Daily heartbeat to the admin (10:00 Moscow winter time = 07:00 UTC).
+[triggers]
+crons = ["0 7 * * *"]

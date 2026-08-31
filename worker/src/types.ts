@@ -57,4 +57,5 @@ export interface Env {
   TG_ADMIN_IDS?: string;
   TLSSKIPVERIFY?: string;
   SETUP_KEY?: string;
+  ADMIN_LOG_CHAT?: number;
 }

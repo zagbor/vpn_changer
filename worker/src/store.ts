@@ -85,4 +85,17 @@ export class Store {
   async deleteBindState(chatId: number): Promise<void> {
     await this.kv.delete(`bind:${chatId}`);
   }
+
+  // Selected router for next .conf upload (temporary, per user).
+  async getSelected(chatId: number): Promise<string | null> {
+    return this.kv.get(`sel:${chatId}`);
+  }
+
+  async setSelected(chatId: number, name: string): Promise<void> {
+    await this.kv.put(`sel:${chatId}`, name, { expirationTtl: 1800 }); // 30 min
+  }
+
+  async deleteSelected(chatId: number): Promise<void> {
+    await this.kv.delete(`sel:${chatId}`);
+  }
 }
