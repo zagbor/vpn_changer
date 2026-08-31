@@ -52,7 +52,7 @@ export default {
         }
       } catch (e: any) {
         console.error("webhook error:", e?.message || e);
-        await notifyAdmin(env, errMsg, e);
+        await notifyAdmin(env, who(errMsg), e);
       }
       return new Response("ok");
     }
@@ -76,6 +76,26 @@ export default {
       );
       const out = await res.json();
       return new Response(JSON.stringify({ webhookUrl, telegram: out }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (url.pathname === "/testadmin") {
+      const key = url.searchParams.get("key");
+      if (!env.SETUP_KEY || key !== env.SETUP_KEY) {
+        return new Response("forbidden", { status: 403 });
+      }
+      const adminChat = env.ADMIN_LOG_CHAT;
+      if (!adminChat || !env.TG_BOT_TOKEN) {
+        return new Response("ADMIN_LOG_CHAT not configured", { status: 500 });
+      }
+      const ok = true;
+      try {
+        await sendMessage(env.TG_BOT_TOKEN, adminChat, "✅ Тестовое уведомление админу. Бот настроен, логи будут приходить сюда.");
+      } catch (e: any) {
+        return new Response("send failed: " + e?.message, { status: 500 });
+      }
+      return new Response(JSON.stringify({ ok, adminChat }), {
         headers: { "Content-Type": "application/json" },
       });
     }
@@ -112,21 +132,10 @@ function isAllowed(env: Env, chatId: number): boolean {
 }
 
 // notifyAdmin sends an error/event log to the bot operator's Telegram chat.
-// msg identifies which user/chat triggered the event so the operator knows
-// who the error came from.
-async function notifyAdmin(env: Env, msg: TelegramMessage | undefined, err: unknown): Promise<void> {
+// detail identifies who triggered it so the operator knows where it came from.
+async function notifyAdmin(env: Env, detail: string, err: unknown): Promise<void> {
   const adminChat = env.ADMIN_LOG_CHAT;
   if (!adminChat || !env.TG_BOT_TOKEN) return;
-
-  const who = msg
-    ? `пользователь: ${msg.chat?.id}${msg.chat?.type ? " (" + msg.chat.type + ")" : ""}`
-    : "пользователь: неизвестен";
-  const what =
-    msg?.text != null
-      ? `сообщение: ${msg.text.slice(0, 200)}`
-      : msg?.document?.file_name
-      ? `файл: ${msg.document.file_name}`
-      : "";
 
   let errText = "";
   if (err instanceof Error) {
@@ -141,8 +150,7 @@ async function notifyAdmin(env: Env, msg: TelegramMessage | undefined, err: unkn
 
   const log = [
     "⚠️ Ошибка бота:",
-    who,
-    what,
+    detail,
     `ошибка: ${errText.slice(0, 600)}`,
   ].filter(Boolean).join(CRLF);
 
@@ -150,6 +158,39 @@ async function notifyAdmin(env: Env, msg: TelegramMessage | undefined, err: unkn
     await sendMessage(env.TG_BOT_TOKEN, adminChat, log);
   } catch {
     // never let logging break message handling
+  }
+}
+
+// back sends an informational message to the user with a "home" button.
+async function back(env: Env, chatId: number, text: string): Promise<void> {
+  await sendInlineKeyboard(
+    env.TG_BOT_TOKEN,
+    chatId,
+    text,
+    [{ text: "🏠 В начало", callback_data: "nav:main" }]
+  );
+}
+
+// who describes a user/chat for the admin log.
+function who(msg: TelegramMessage | undefined, chatId?: number): string {
+  if (msg?.chat?.id) {
+    return `пользователь: ${msg.chat.id}${msg.chat.type ? " (" + msg.chat.type + ")" : ""}`;
+  }
+  if (chatId) return `пользователь: ${chatId}`;
+  return "пользователь: неизвестен";
+}
+
+// userError logs the error to the admin AND shows it to the user (with home
+// button). Use for every soft error we send the user so the operator sees logs.
+async function userError(env: Env, text: string, msg?: TelegramMessage, chatId?: number): Promise<void> {
+  try {
+    await notifyAdmin(env, who(msg, chatId), new Error(text));
+  } catch {
+    // logging must never break the user-facing reply
+  }
+  const id = msg?.chat?.id ?? chatId;
+  if (id) {
+    await back(env, id, text);
   }
 }
 
@@ -384,13 +425,13 @@ async function finishBind(
   const c = new KeeneticClient(state.url, state.login, state.password);
   const alive = await c.ping();
   if (!alive) {
-    await sendMessage(env.TG_BOT_TOKEN, chatId, "Роутер недоступен. Проверьте URL.");
+    await userError(env, "Роутер недоступен. Проверьте URL.", undefined, chatId);
     return;
   }
   try {
     await c.auth();
   } catch (e: any) {
-    await sendMessage(env.TG_BOT_TOKEN, chatId, "Ошибка авторизации: " + e.message);
+    await userError(env, "Ошибка авторизации: " + e.message, undefined, chatId);
     return;
   }
 
@@ -406,12 +447,12 @@ async function finishBind(
   try {
     await store.add(binding);
   } catch (e: any) {
-    await sendMessage(env.TG_BOT_TOKEN, chatId, "Ошибка сохранения: " + e.message);
+    await userError(env, "Ошибка сохранения: " + e.message, undefined, chatId);
     return;
   }
 
   const target = state.interface_id || "импорт как новый файл";
-  await sendMessage(env.TG_BOT_TOKEN, chatId, `Роутер ${state.name} привязан! Цель: ${target}.\nТеперь отправьте WireGuard .conf, чтобы заменить VPN.`);
+  await back(env, chatId, `Роутер ${state.name} привязан! Цель: ${target}.\nТеперь отправьте WireGuard .conf, чтобы заменить VPN.`);
 }
 
 async function listRouters(chatId: number, store: Store, env: Env): Promise<void> {
@@ -562,7 +603,7 @@ async function handleCallback(cq: CallbackQuery, env: Env): Promise<void> {
       if (action === "select") {
         await store.get(chatId, name);
         await store.setSelected(chatId, name);
-        await sendMessage(env.TG_BOT_TOKEN, chatId, `Роутер ${name} выбран. Отправьте WireGuard .conf — он будет применён именно к нему.`);
+        await back(env, chatId, `Роутер ${name} выбран. Отправьте WireGuard .conf — он будет применён именно к нему.`);
       } else if (action === "status") {
         await status(chatId, name, store, env);
       } else if (action === "remove") {
@@ -608,6 +649,11 @@ async function handleCallback(cq: CallbackQuery, env: Env): Promise<void> {
 
     await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id, "Неизвестная кнопка");
   } catch (e: any) {
+    try {
+      await notifyAdmin(env, who(undefined, chatId) + " (кнопка: " + data + ")", e);
+    } catch {
+      // ignore
+    }
     await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id, "Ошибка: " + (e?.message || e));
   }
 }
@@ -615,9 +661,9 @@ async function handleCallback(cq: CallbackQuery, env: Env): Promise<void> {
 async function unbind(chatId: number, name: string, store: Store, env: Env): Promise<void> {
   try {
     await store.remove(chatId, name);
-    await sendMessage(env.TG_BOT_TOKEN, chatId, `Роутер ${name} удалён.`);
+    await back(env, chatId, `Роутер ${name} удалён.`);
   } catch (e: any) {
-    await sendMessage(env.TG_BOT_TOKEN, chatId, "Ошибка: " + e.message);
+    await userError(env, "Ошибка отвязки: " + e.message, undefined, chatId);
   }
 }
 
@@ -629,24 +675,24 @@ async function wipeConfigs(chatId: number, name: string, store: Store, env: Env)
   try {
     bd = await store.get(chatId, name);
   } catch (e: any) {
-    await sendMessage(env.TG_BOT_TOKEN, chatId, e.message);
+    await userError(env, e.message, undefined, chatId);
     return;
   }
 
   const c = new KeeneticClient(bd.url, bd.login, bd.password);
   const alive = await c.ping();
   if (!alive) {
-    await sendMessage(env.TG_BOT_TOKEN, chatId, "Роутер недоступен.");
+    await userError(env, `Роутер ${name} недоступен.`, undefined, chatId);
     return;
   }
   try {
     await c.auth();
   } catch (e: any) {
-    await sendMessage(env.TG_BOT_TOKEN, chatId, "Ошибка авторизации: " + e.message);
+    await userError(env, "Ошибка авторизации: " + e.message, undefined, chatId);
     return;
   }
 
-  await sendMessage(env.TG_BOT_TOKEN, chatId, `Очищаю WireGuard-конфиги на роутере ${name}...`);
+  await back(env, chatId, `Очищаю WireGuard-конфиги на роутере ${name}...`);
   try {
     const removed = await c.deleteAllWireGuard();
     if (bd.interface_id) {
@@ -657,13 +703,13 @@ async function wipeConfigs(chatId: number, name: string, store: Store, env: Env)
         // router binding may be unchanged; ignore
       }
     }
-    await sendMessage(
-      env.TG_BOT_TOKEN,
+    await back(
+      env,
       chatId,
       `С роутера ${name} удалено конфигов: ${removed}. VPN снят, интернет вернётся на Ethernet.`
     );
   } catch (e: any) {
-    await sendMessage(env.TG_BOT_TOKEN, chatId, "Не удалось удалить конфиги: " + e.message);
+    await userError(env, "Не удалось удалить конфиги: " + e.message, undefined, chatId);
   }
 }
 
@@ -674,13 +720,13 @@ async function status(chatId: number, arg: string, store: Store, env: Env): Prom
     const c = new KeeneticClient(bd.url, bd.login, bd.password);
     const alive = await c.ping();
     if (!alive) {
-      await sendMessage(env.TG_BOT_TOKEN, chatId, "Роутер недоступен.");
+      await userError(env, `Роутер ${bd.name} недоступен.`, undefined, chatId);
       return;
     }
     await c.auth();
-    await sendMessage(env.TG_BOT_TOKEN, chatId, `Роутер ${bd.name} на связи и авторизован.`);
+    await back(env, chatId, `Роутер ${bd.name} на связи и авторизован.`);
   } catch (e: any) {
-    await sendMessage(env.TG_BOT_TOKEN, chatId, e.message);
+    await userError(env, e.message, undefined, chatId);
   }
 }
 
@@ -722,7 +768,7 @@ async function handleDocument(
   try {
     bd = await store.get(chatId, name);
   } catch (e: any) {
-    await sendMessage(env.TG_BOT_TOKEN, chatId, e.message);
+    await userError(env, e.message, msg);
     return;
   }
 
@@ -737,7 +783,7 @@ async function handleDocument(
   try {
     conf = await downloadTelegramFile(env.TG_BOT_TOKEN, doc.file_id);
   } catch (e: any) {
-    await sendMessage(env.TG_BOT_TOKEN, chatId, "Не удалось скачать файл: " + e.message);
+    await userError(env, "Не удалось скачать файл: " + e.message, msg);
     return;
   }
 
@@ -756,13 +802,13 @@ async function applyConf(
 
   const alive = await c.ping();
   if (!alive) {
-    await sendMessage(env.TG_BOT_TOKEN, chatId, "Роутер недоступен.");
+    await userError(env, `Роутер ${bd.name} недоступен.`, undefined, chatId);
     return;
   }
   try {
     await c.auth();
   } catch (e: any) {
-    await sendMessage(env.TG_BOT_TOKEN, chatId, "Авторизация не удалась: " + e.message);
+    await userError(env, "Авторизация не удалась: " + e.message, undefined, chatId);
     return;
   }
 
@@ -770,20 +816,20 @@ async function applyConf(
   // 1) remove all existing WireGuard interfaces,
   // 2) import the new config (creates one clean interface),
   // 3) enable the imported interface.
-  await sendMessage(env.TG_BOT_TOKEN, chatId, `Очищаю старые WireGuard-конфиги на роутере ${bd.name}...`);
+  await back(env, chatId, `Очищаю старые WireGuard-конфиги на роутере ${bd.name}...`);
   let removed = 0;
   try {
     removed = await c.deleteAllWireGuard();
   } catch (e: any) {
-    await sendMessage(env.TG_BOT_TOKEN, chatId, "Не удалось очистить старые конфиги: " + e.message);
+    await userError(env, "Не удалось очистить старые конфиги: " + e.message, undefined, chatId);
     return;
   }
 
-  await sendMessage(env.TG_BOT_TOKEN, chatId, `Импортирую новый конфиг на роутер ${bd.name}...`);
+  await back(env, chatId, `Импортирую новый конфиг на роутер ${bd.name}...`);
   try {
     await c.importWireGuard(conf, fileName);
   } catch (e: any) {
-    await sendMessage(env.TG_BOT_TOKEN, chatId, "Ошибка импорта: " + e.message);
+    await userError(env, "Ошибка импорта: " + e.message, undefined, chatId);
     return;
   }
 
@@ -794,7 +840,7 @@ async function applyConf(
   } catch {}
   const newId = ifaces.length === 1 ? ifaces[0].id : "";
   if (!newId) {
-    await sendMessage(env.TG_BOT_TOKEN, chatId, `Конфигурация WireGuard загружена на ${bd.name} как ${fileName}. Не удалось определить интерфейс для включения (конфигов: ${ifaces.length}) — включите вручную.`);
+    await userError(env, `Конфигурация WireGuard загружена на ${bd.name} как ${fileName}. Не удалось определить интерфейс для включения (конфигов: ${ifaces.length}) — включите вручную.`, undefined, chatId);
     return;
   }
 
@@ -806,12 +852,12 @@ async function applyConf(
     try {
       await c.setGlobalPriority(newId, 10, 0);
     } catch (e: any) {
-      await sendMessage(env.TG_BOT_TOKEN, chatId, `VPN включён (${newId}), но не удалось сделать его основным интернет-подключением: ` + e.message);
+      await userError(env, `VPN включён (${newId}), но не удалось сделать его основным интернет-подключением: ` + e.message, undefined, chatId);
       return;
     }
-    await sendMessage(env.TG_BOT_TOKEN, chatId, `Конфигурация WireGuard на ${bd.name} включена (интерфейс ${newId}) и назначена основным интернет-подключением (Ethernet — резерв). Старых конфигов очищено: ${removed}.`);
+    await back(env, chatId, `Конфигурация WireGuard на ${bd.name} включена (интерфейс ${newId}) и назначена основным интернет-подключением (Ethernet — резерв). Старых конфигов очищено: ${removed}.`);
   } catch (e: any) {
-    await sendMessage(env.TG_BOT_TOKEN, chatId, `Конфигурация загружена, но не удалось включить интерфейс: ` + e.message);
+    await userError(env, `Конфигурация загружена, но не удалось включить интерфейс: ` + e.message, undefined, chatId);
   }
 }
 

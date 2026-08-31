@@ -3,23 +3,40 @@ import type { AscParams, PeerParams, WireGuardInterface } from "./types.js";
 
 export class KeeneticClient {
   private baseURL: string;
+  private alternateBaseURL?: string;
   private login: string;
   private pass: string;
   private cookie = "";
 
   constructor(baseURL: string, login: string, pass: string) {
     let url = (baseURL || "").trim();
-    if (!/^https?:\/\//i.test(url)) {
+    let scheme = "notset";
+    if (/^https:\/\//i.test(url)) scheme = "https";
+    else if (/^http:\/\//i.test(url)) scheme = "http";
+
+    if (scheme === "notset") {
       url = "https://" + url.replace(/^\/+/, "");
     }
-    this.baseURL = url.replace(/\/+$/, "");
+    const host = url.replace(/^[a-z]+:\/\//i, "").replace(/\/+$/, "");
+
+    // Prefer HTTPS: Keenetic often rejects RCI auth over plain HTTP even when
+    // the router is reachable. Keep an HTTP variant only as a fallback for
+    // routers that do not serve HTTPS at all.
+    this.baseURL = `https://${host}`;
+    this.alternateBaseURL = `http://${host}`;
     this.login = login;
     this.pass = pass;
   }
 
   async ping(): Promise<boolean> {
+    if (await this.tryPing(this.baseURL)) return true;
+    if (this.alternateBaseURL) return this.tryPing(this.alternateBaseURL);
+    return false;
+  }
+
+  private async tryPing(base: string): Promise<boolean> {
     try {
-      const resp = await fetch(`${this.baseURL}/rci/show/version`, {
+      const resp = await fetch(`${base}/rci/show/version`, {
         signal: AbortSignal.timeout(15000),
       });
       return resp.status === 200 || resp.status === 401;
@@ -28,8 +45,22 @@ export class KeeneticClient {
     }
   }
 
+  // fetchBase requests against the primary (https) base, falling back to the
+  // alternate (http) base only on network-level failures. It never falls back
+  // on HTTP error statuses, so Keenetic's auth rejects are preserved.
+  private async fetchBase(path: string, init?: RequestInit): Promise<Response> {
+    try {
+      return await fetch(`${this.baseURL}${path}`, init);
+    } catch (e) {
+      if (this.alternateBaseURL && this.alternateBaseURL !== this.baseURL) {
+        return await fetch(`${this.alternateBaseURL}${path}`, init);
+      }
+      throw e;
+    }
+  }
+
   async auth(): Promise<void> {
-    const resp = await fetch(`${this.baseURL}/auth`, {
+    const resp = await this.fetchBase("/auth", {
       signal: AbortSignal.timeout(15000),
     });
 
@@ -51,7 +82,7 @@ export class KeeneticClient {
     const md5sum = md5hex(`${this.login}:${realm}:${this.pass}`);
     const passHash = await sha256hex(challenge + md5sum);
 
-    const resp2 = await fetch(`${this.baseURL}/auth`, {
+    const resp2 = await this.fetchBase("/auth", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -96,7 +127,7 @@ export class KeeneticClient {
       if (contentType) headers["Content-Type"] = contentType;
       if (this.cookie) headers["Cookie"] = this.cookie;
 
-      const resp = await fetch(`${this.baseURL}${path}`, {
+      const resp = await this.fetchBase(path, {
         method,
         headers,
         body: body ? JSON.stringify(body) : undefined,
