@@ -1,4 +1,5 @@
 import { KeeneticClient } from "./keenetic.js";
+import { ImpioClient, ImpioError } from "./impio.js";
 import { sendMessage, sendInlineKeyboard, answerCallbackQuery, downloadTelegramFile, splitCmd, type TelegramMessage } from "./telegram.js";
 import { Store } from "./store.js";
 import type { Env, Binding } from "./types.js";
@@ -117,6 +118,47 @@ export default {
       );
     }
 
+    // Temporary diagnostic: probe a target URL from inside Cloudflare's
+    // network so we can see exactly why the router appears unreachable.
+    if (url.pathname === "/probe") {
+      const key = url.searchParams.get("key");
+      if (!env.SETUP_KEY || key !== env.SETUP_KEY) {
+        return new Response("forbidden", { status: 403 });
+      }
+      const target = url.searchParams.get("url") || "";
+      if (!target) {
+        return new Response("missing url", { status: 400 });
+      }
+      const timeout = parseInt(url.searchParams.get("timeout") || "15", 10);
+      const report: Record<string, any> = {
+        target,
+        dns: { ok: false },
+        http: null,
+        error: null,
+      };
+      try {
+        const resp = await fetch(target, { signal: AbortSignal.timeout(timeout * 1000), redirect: "manual" });
+        report.http = {
+          status: resp.status,
+          headers: Object.fromEntries(resp.headers.entries()),
+        };
+      } catch (e: any) {
+        report.error = String(e?.message || e);
+      }
+      try {
+        const dns = await fetch(
+          `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(new URL(target).hostname)}&type=A`,
+          { headers: { accept: "application/dns-json" } }
+        ).then((r) => r.json());
+        report.dns = dns;
+      } catch (e: any) {
+        report.dns = { ok: false, error: String(e?.message || e) };
+      }
+      return new Response(JSON.stringify(report, null, 2), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
     return new Response("Not Found", { status: 404 });
   },
 };
@@ -194,6 +236,23 @@ async function userError(env: Env, text: string, msg?: TelegramMessage, chatId?:
   }
 }
 
+// retry runs fn up to attempts times, waiting delayMs between attempts.
+// Used for transient network unavailability (router rebooting, Wi-Fi hop, etc.).
+async function retry<T>(fn: () => Promise<T>, attempts = 3, delayMs = 3000): Promise<T> {
+  let lastErr: any;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (e: any) {
+      lastErr = e;
+      if (i < attempts - 1) {
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 function helpText(): string {
   return [
     "VPN Changer — замена WireGuard на роутере Keenetic через Telegram.",
@@ -228,6 +287,13 @@ async function handleMessage(msg: TelegramMessage, env: Env): Promise<void> {
   const bindState = await store.getBindState(chatId);
   if (bindState && msg.text) {
     await handleBindStep(msg, bindState, store, env);
+    return;
+  }
+
+  // Multi-step impio authorization
+  const impioBindState = await store.getImpioBindState(chatId);
+  if (impioBindState && msg.text) {
+    await handleImpioBindStep(msg, impioBindState, store, env);
     return;
   }
 
@@ -290,6 +356,26 @@ async function handleMessage(msg: TelegramMessage, env: Env): Promise<void> {
 
     case "/diagwire":
       await diagWire(chatId, arg, store, env);
+      break;
+
+    case "/impio":
+      await showMainMenu(chatId, env);
+      break;
+
+    case "/impio_login":
+      await impioStartLogin(chatId, store, env);
+      break;
+
+    case "/impio_sync":
+      await impioSync(chatId, arg, store, env);
+      break;
+
+    case "/impio_status":
+      await impioStatus(chatId, store, env);
+      break;
+
+    case "/impio_logout":
+      await impioLogout(chatId, store, env);
       break;
 
     default:
@@ -423,13 +509,18 @@ async function finishBind(
   env: Env
 ): Promise<void> {
   const c = new KeeneticClient(state.url, state.login, state.password);
-  const alive = await c.ping();
+  let alive = false;
+  try {
+    alive = await retry(() => c.ping(), 3, 3000);
+  } catch {
+    alive = false;
+  }
   if (!alive) {
     await userError(env, "Роутер недоступен. Проверьте URL.", undefined, chatId);
     return;
   }
   try {
-    await c.auth();
+    await retry(() => c.auth(), 3, 3000);
   } catch (e: any) {
     await userError(env, "Ошибка авторизации: " + e.message, undefined, chatId);
     return;
@@ -486,18 +577,44 @@ async function selectRouter(chatId: number, store: Store, env: Env): Promise<voi
 // showMainMenu renders the top-level button menu.
 async function showMainMenu(chatId: number, env: Env): Promise<void> {
   const buttons = [
-    { text: "📡 Привязать роутер", callback_data: "nav:bind" },
-    { text: "🖥 Выбрать роутер (.conf)", callback_data: "nav:select" },
-    { text: "📊 Статус роутера", callback_data: "nav:status" },
-    { text: "📋 Список роутеров", callback_data: "nav:list" },
-    { text: "🗑 Отвязать роутер", callback_data: "nav:remove" },
-    { text: "🧹 Удалить конфиги с роутера", callback_data: "nav:wipe" },
-    { text: "🆘 Помощь", callback_data: "nav:help" },
+    { text: "📡 Авторизация роутера", callback_data: "nav:router-auth" },
+    { text: "🔑 Авторизация Impio", callback_data: "nav:impio-auth" },
+    { text: "🔌 Подключение ключа на роутере", callback_data: "nav:io-connect" },
   ];
   await sendInlineKeyboard(
     env.TG_BOT_TOKEN,
     chatId,
     "Главное меню VPN Changer. Выберите действие:",
+    buttons
+  );
+}
+
+// showRouterAuthMenu shows the router authorization submenu (bind / unbind).
+async function showRouterAuthMenu(chatId: number, env: Env): Promise<void> {
+  const buttons = [
+    { text: "📡 Привязать роутер", callback_data: "nav:binds" },
+    { text: "🚫 Отвязать роутер", callback_data: "nav:router-unbind" },
+    { text: "🏠 В начало", callback_data: "nav:main" },
+  ];
+  await sendInlineKeyboard(
+    env.TG_BOT_TOKEN,
+    chatId,
+    "Авторизация роутера. Выберите действие:",
+    buttons
+  );
+}
+
+// showImpioAuthMenu shows the Impio account authorization submenu (bind / unbind).
+async function showImpioAuthMenu(chatId: number, env: Env): Promise<void> {
+  const buttons = [
+    { text: "🔑 Привязать аккаунт Impio", callback_data: "nav:impio-bind" },
+    { text: "🚫 Отвязать аккаунт Impio", callback_data: "nav:impio-unbind" },
+    { text: "🏠 В начало", callback_data: "nav:main" },
+  ];
+  await sendInlineKeyboard(
+    env.TG_BOT_TOKEN,
+    chatId,
+    "Авторизация Impio. Выберите действие:",
     buttons
   );
 }
@@ -551,6 +668,7 @@ async function handleCallback(cq: CallbackQuery, env: Env): Promise<void> {
           await showMainMenu(chatId, env);
           break;
         case "bind":
+        case "binds":
           await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id, "Начинаю привязку");
           await store.setBindState(chatId, { step: 0 });
           await sendInlineKeyboard(
@@ -560,34 +678,30 @@ async function handleCallback(cq: CallbackQuery, env: Env): Promise<void> {
             [{ text: "🏠 В начало", callback_data: "nav:main" }]
           );
           break;
-        case "select":
+        case "router-auth":
           await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id);
-          await pickRouterList(chatId, store, env, "select");
+          await showRouterAuthMenu(chatId, env);
           break;
-        case "status":
-          await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id);
-          await pickRouterList(chatId, store, env, "status");
-          break;
-        case "list":
-          await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id);
-          await listRouters(chatId, store, env);
-          break;
-        case "remove":
+        case "router-unbind":
           await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id);
           await pickRouterList(chatId, store, env, "remove");
           break;
-        case "wipe":
-          await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id);
-          await pickRouterList(chatId, store, env, "wipe");
+        case "impio-login":
+        case "impio-bind":
+          await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id, "Начинаю авторизацию Impio");
+          await impioStartLogin(chatId, store, env);
           break;
-        case "help":
+        case "impio-auth":
           await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id);
-          await sendInlineKeyboard(
-            env.TG_BOT_TOKEN,
-            chatId,
-            helpText(),
-            [{ text: "🏠 В начало", callback_data: "nav:main" }]
-          );
+          await showImpioAuthMenu(chatId, env);
+          break;
+        case "impio-unbind":
+          await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id, "Отвязываю аккаунт Impio");
+          await impioLogout(chatId, store, env);
+          break;
+        case "io-connect":
+          await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id, "Подключение ключа Impio");
+          await ioConnectMenu(chatId, store, env);
           break;
         default:
           await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id, "Неизвестная команда");
@@ -640,6 +754,96 @@ async function handleCallback(cq: CallbackQuery, env: Env): Promise<void> {
       return;
     }
 
+    if (data.startsWith("io:")) {
+      const io = data.slice(3);
+      await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id);
+      switch (io) {
+        case "login":
+          await impioStartLogin(chatId, store, env);
+          break;
+        case "keys":
+          await impioListKeys(chatId, store, env);
+          break;
+        case "sync":
+          await impioPickRouterForSync(chatId, store, env);
+          break;
+        case "replace":
+          await ioConnectMenu(chatId, store, env);
+          break;
+        case "status":
+          await impioStatus(chatId, store, env);
+          break;
+        case "logout":
+          await impioLogout(chatId, store, env);
+          break;
+        default:
+          await back(env, chatId, "Неизвестное действие Impio.");
+      }
+      return;
+    }
+
+    // pick a router to apply an impio key to
+    if (data.startsWith("iolet:")) {
+      const name = data.slice(6);
+      await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id, `Применяю ключ на ${name}`);
+      await impioFetchAndApply(chatId, name, store, env);
+      return;
+    }
+
+    // "Connect key to router" flow (step 3 of the main menu).
+    // ioconn:<routerName> — router chosen; auto-detect whether it already has a key.
+    if (data.startsWith("ioconn:")) {
+      const router = data.slice(7);
+      await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id, "Проверяю наличие ключа на роутере...");
+      await impioConnectPickRouter(chatId, router, store, env);
+      return;
+    }
+    // iocrtr — pick the router for the connect flow
+    if (data === "iocrtr") {
+      await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id);
+      await impioConnectPickRouterList(chatId, store, env);
+      return;
+    }
+    // ioprot:<typeVpn> — protocol chosen, proceed to old key (replace) or location (create)
+    if (data.startsWith("ioprot:")) {
+      const typeVpn = parseInt(data.slice(7), 10);
+      await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id, "Протокол выбран");
+      await impioReplacePickProtocolDone(chatId, typeVpn, store, env);
+      return;
+    }
+    // ioprotret — user wants to change the protocol after a failure
+    if (data === "ioprotret") {
+      await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id);
+      await impioReplacePickProtocol(chatId, store, env);
+      return;
+    }
+    // ioreplk:<keyId> — old key chosen (replace mode), now pick new location
+    if (data.startsWith("ioreplk:")) {
+      const keyId = parseInt(data.slice(8), 10);
+      await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id);
+      await impioReplacePickLocation(chatId, keyId, store, env);
+      return;
+    }
+    // ioreplnew — user does not want to replace any key; create a fresh one.
+    if (data === "ioreplnew") {
+      await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id, "Создаём новый ключ");
+      await impioReplacePickLocation(chatId, 0, store, env, true);
+      return;
+    }
+    // iorepll:<locationId> — location chosen, show the Execute button
+    if (data.startsWith("iorepll:")) {
+      const locationId = data.slice(8);
+      await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id);
+      await impioReplaceConfirm(chatId, locationId, store, env);
+      return;
+    }
+    // ioreplexec — run all operations sequentially
+    if (data === "ioreplexec") {
+      await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id, "Выполняю подключение ключа...");
+      await impioReplaceExecute(chatId, store, env);
+      return;
+    }
+
     if (data.startsWith("dowipe:")) {
       const name = data.slice(7);
       await answerCallbackQuery(env.TG_BOT_TOKEN, cq.id, `Очищаю ${name}`);
@@ -680,13 +884,18 @@ async function wipeConfigs(chatId: number, name: string, store: Store, env: Env)
   }
 
   const c = new KeeneticClient(bd.url, bd.login, bd.password);
-  const alive = await c.ping();
+  let alive = false;
+  try {
+    alive = await retry(() => c.ping(), 3, 3000);
+  } catch {
+    alive = false;
+  }
   if (!alive) {
     await userError(env, `Роутер ${name} недоступен.`, undefined, chatId);
     return;
   }
   try {
-    await c.auth();
+    await retry(() => c.auth(), 3, 3000);
   } catch (e: any) {
     await userError(env, "Ошибка авторизации: " + e.message, undefined, chatId);
     return;
@@ -718,12 +927,17 @@ async function status(chatId: number, arg: string, store: Store, env: Env): Prom
   try {
     const bd = await store.get(chatId, name);
     const c = new KeeneticClient(bd.url, bd.login, bd.password);
-    const alive = await c.ping();
+    let alive = false;
+    try {
+      alive = await retry(() => c.ping(), 3, 3000);
+    } catch {
+      alive = false;
+    }
     if (!alive) {
       await userError(env, `Роутер ${bd.name} недоступен.`, undefined, chatId);
       return;
     }
-    await c.auth();
+    await retry(() => c.auth(), 3, 3000);
     await back(env, chatId, `Роутер ${bd.name} на связи и авторизован.`);
   } catch (e: any) {
     await userError(env, e.message, undefined, chatId);
@@ -790,26 +1004,40 @@ async function handleDocument(
   await applyConf(chatId, bd, fileName, conf, env, store);
 }
 
+interface ApplyResult {
+  ok: boolean;
+  retryable: boolean;
+  message: string;
+}
+
 async function applyConf(
   chatId: number,
   bd: Binding,
   fileName: string,
   conf: string,
   env: Env,
-  store: Store
-): Promise<void> {
+  store: Store,
+  report = true
+): Promise<ApplyResult> {
   const c = new KeeneticClient(bd.url, bd.login, bd.password);
 
-  const alive = await c.ping();
+  let alive = false;
+  try {
+    alive = await retry(() => c.ping(), 3, 3000);
+  } catch {
+    alive = false;
+  }
   if (!alive) {
-    await userError(env, `Роутер ${bd.name} недоступен.`, undefined, chatId);
-    return;
+    const msg = `Роутер ${bd.name} недоступен.`;
+    if (report) await userError(env, msg, undefined, chatId);
+    return { ok: false, retryable: false, message: msg };
   }
   try {
-    await c.auth();
+    await retry(() => c.auth(), 3, 3000);
   } catch (e: any) {
-    await userError(env, "Авторизация не удалась: " + e.message, undefined, chatId);
-    return;
+    const msg = "Авторизация не удалась: " + e.message;
+    if (report) await userError(env, msg, undefined, chatId);
+    return { ok: false, retryable: false, message: msg };
   }
 
   // Strategy: this config becomes the ONLY WireGuard VPN on the router.
@@ -821,27 +1049,39 @@ async function applyConf(
   try {
     removed = await c.deleteAllWireGuard();
   } catch (e: any) {
-    await userError(env, "Не удалось очистить старые конфиги: " + e.message, undefined, chatId);
-    return;
+    const msg = "Не удалось очистить старые конфиги: " + e.message;
+    if (report) await userError(env, msg, undefined, chatId);
+    return { ok: false, retryable: true, message: msg };
   }
 
   await back(env, chatId, `Импортирую новый конфиг на роутер ${bd.name}...`);
   try {
     await c.importWireGuard(conf, fileName);
   } catch (e: any) {
-    await userError(env, "Ошибка импорта: " + e.message, undefined, chatId);
-    return;
+    const msg = "Ошибка импорта: " + e.message;
+    if (report) await userError(env, msg, undefined, chatId);
+    return { ok: false, retryable: true, message: msg };
   }
 
-  // Determine the single imported interface and enable it.
+  // Determine the single imported interface and enable it. Keenetic creates the
+  // WireGuard interface asynchronously after import, so poll briefly until it
+  // shows up before deciding the imported interface id.
   let ifaces: any[] = [];
-  try {
-    ifaces = await c.showWireGuardInterfaces();
-  } catch {}
-  const newId = ifaces.length === 1 ? ifaces[0].id : "";
+  let newId = "";
+  for (let attempt = 0; attempt < 6; attempt++) {
+    try {
+      ifaces = await c.showWireGuardInterfaces();
+    } catch {}
+    if (ifaces.length === 1) {
+      newId = ifaces[0].id;
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 700));
+  }
   if (!newId) {
-    await userError(env, `Конфигурация WireGuard загружена на ${bd.name} как ${fileName}. Не удалось определить интерфейс для включения (конфигов: ${ifaces.length}) — включите вручную.`, undefined, chatId);
-    return;
+    const msg = `Конфигурация WireGuard загружена на ${bd.name} как ${fileName}. Не удалось определить интерфейс для включения (конфигов: ${ifaces.length}) — включите вручную.`;
+    if (report) await userError(env, msg, undefined, chatId);
+    return { ok: false, retryable: true, message: msg };
   }
 
   try {
@@ -852,12 +1092,25 @@ async function applyConf(
     try {
       await c.setGlobalPriority(newId, 10, 0);
     } catch (e: any) {
-      await userError(env, `VPN включён (${newId}), но не удалось сделать его основным интернет-подключением: ` + e.message, undefined, chatId);
-      return;
+      const msg = `VPN включён (${newId}), но не удалось сделать его основным интернет-подключением: ` + e.message;
+      if (report) await userError(env, msg, undefined, chatId);
+      return { ok: false, retryable: false, message: msg };
     }
-    await back(env, chatId, `Конфигурация WireGuard на ${bd.name} включена (интерфейс ${newId}) и назначена основным интернет-подключением (Ethernet — резерв). Старых конфигов очищено: ${removed}.`);
+    // Put the VPN interface on top and enabled in the "VPN" connection policy.
+    try {
+      await c.enableInVpnPolicy(newId);
+    } catch (e: any) {
+      const msg = `VPN включён и назначен основным, но не удалось включить его в политику VPN: ` + e.message;
+      if (report) await userError(env, msg, undefined, chatId);
+      return { ok: false, retryable: false, message: msg };
+    }
+    const okMsg = `Конфигурация WireGuard на ${bd.name} включена (интерфейс ${newId}), назначена основным интернет-подключением и поставлена первой в политике VPN (Ethernet — резерв). Старых конфигов очищено: ${removed}.`;
+    await back(env, chatId, okMsg);
+    return { ok: true, retryable: false, message: okMsg };
   } catch (e: any) {
-    await userError(env, `Конфигурация загружена, но не удалось включить интерфейс: ` + e.message, undefined, chatId);
+    const msg = `Конфигурация загружена, но не удалось включить интерфейс: ` + e.message;
+    if (report) await userError(env, msg, undefined, chatId);
+    return { ok: false, retryable: true, message: msg };
   }
 }
 
@@ -934,3 +1187,781 @@ async function adminUnbind(chatId: number, arg: string, store: Store, env: Env):
     await sendMessage(env.TG_BOT_TOKEN, chatId, e.message);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Impio (my.impio.space) — authorization & automatic key application
+// ---------------------------------------------------------------------------
+
+// impioStartLogin begins the multi-step authorization flow.
+async function impioStartLogin(chatId: number, store: Store, env: Env): Promise<void> {
+  await store.setImpioBindState(chatId, { step: 0 });
+  await sendInlineKeyboard(
+    env.TG_BOT_TOKEN,
+    chatId,
+    "Авторизация на my.impio.space.\n\nШаг 1/2: введите логин (или email) от аккаунта impio.",
+    [{ text: "🏠 В начало", callback_data: "nav:main" }]
+  );
+}
+
+// impioCancel clears any in-progress impio auth.
+async function impioCancel(chatId: number, store: Store, env: Env): Promise<void> {
+  try {
+    await store.deleteImpioBindState(chatId);
+  } catch {
+    // ignore
+  }
+  await showMainMenu(chatId, env);
+}
+
+// handleImpioBindStep processes each text step of the impio authorization flow.
+async function handleImpioBindStep(
+  msg: TelegramMessage,
+  state: any,
+  store: Store,
+  env: Env
+): Promise<void> {
+  const chatId = msg.chat.id;
+  const text = (msg.text || "").trim();
+
+  switch (state.step) {
+    case 0: // username
+      state.username = text;
+      state.step = 1;
+      await store.setImpioBindState(chatId, state);
+      await sendMessage(env.TG_BOT_TOKEN, chatId, "Шаг 2/2: введите пароль от аккаунта impio.");
+      break;
+
+    case 1: // password -> attempt login
+      state.password = text;
+      state.step = 2;
+      await store.setImpioBindState(chatId, state);
+      await sendMessage(env.TG_BOT_TOKEN, chatId, "Проверяю учётные данные...");
+      try {
+        const c = new ImpioClient();
+        const res = await c.login(state.username, state.password);
+        if (res.two_factor_required) {
+          state.two_factor_token = res.two_factor_token;
+          state.step = 3; // wait for 2FA code
+          await store.setImpioBindState(chatId, state);
+          await sendMessage(env.TG_BOT_TOKEN, chatId, "Включена двухфакторная аутентификация.\nВведите код подтверждения из приложения/сообщения:");
+          return;
+        }
+        await saveImpioSession(chatId, state, c, store, env);
+      } catch (e: any) {
+        await store.deleteImpioBindState(chatId);
+        await userError(env, "Не удалось авторизоваться на impio: " + e.message, msg);
+      }
+      break;
+
+    case 2: // verify 2FA code
+      if (!state.two_factor_token) {
+        await impioCancel(chatId, store, env);
+        return;
+      }
+      await sendMessage(env.TG_BOT_TOKEN, chatId, "Проверяю код...");
+      try {
+        const c = new ImpioClient();
+        await c.verifyTwoFactor(state.two_factor_token, text);
+        await saveImpioSession(chatId, state, c, store, env);
+      } catch (e: any) {
+        await store.deleteImpioBindState(chatId);
+        await userError(env, "2FA-код неверный: " + e.message, msg);
+      }
+      break;
+
+    default:
+      await impioCancel(chatId, store, env);
+  }
+}
+
+// saveImpioSession persists the verified impio credentials and confirms login.
+async function saveImpioSession(
+  chatId: number,
+  state: any,
+  c: ImpioClient,
+  store: Store,
+  env: Env
+): Promise<void> {
+  const account = {
+    chat_id: chatId,
+    username: state.username,
+    password: state.password,
+  };
+  try {
+    if (await store.hasImpio(chatId)) await store.updateImpio(account);
+    else await store.addImpio(account);
+  } catch (e: any) {
+    await store.deleteImpioBindState(chatId);
+    await userError(env, "Ошибка сохранения аккаунта impio: " + e.message, undefined, chatId);
+    return;
+  }
+  await store.deleteImpioBindState(chatId);
+  try {
+    await c.logout();
+  } catch {
+    // ignore
+  }
+  await back(env, chatId, `Авторизация на my.impio.space прошла успешно (${state.username}).\n\nТеперь в главном меню нажмите «🔄 Подменить ключ на роутере через Impio».`);
+}
+
+// getImpioSession builds an ImpioClient and performs a fresh login using the
+// stored credentials, returning the logged-in client.
+async function getImpioSession(chatId: number, store: Store): Promise<ImpioClient> {
+  const acc = await store.getImpio(chatId);
+  const c = new ImpioClient();
+  const res = await c.login(acc.username, acc.password);
+  if (res.two_factor_required) {
+    throw new ImpioError("Для аккаунта impio включена 2FA — авторизация требует код. Перепроверьте аккаунт.");
+  }
+  return c;
+}
+
+// impioStatus verifies the account can log in.
+async function impioStatus(chatId: number, store: Store, env: Env): Promise<void> {
+  let username = "";
+  try {
+    const acc = await store.getImpio(chatId);
+    username = acc.username;
+  } catch (e: any) {
+    await back(env, chatId, e.message);
+    return;
+  }
+  try {
+    const c = await getImpioSession(chatId, store);
+    const keys = await c.getKeys();
+    try {
+      await c.logout();
+    } catch {
+      // ignore
+    }
+    await back(env, chatId, `✅ Связь с my.impio.space работает (${username}).\nДоступных ключей: ${keys.length}.`);
+  } catch (e: any) {
+    await userError(env, "Не удалось подтвердить подключение к impio: " + e.message, undefined, chatId);
+  }
+}
+
+// impioListKeys logs in and shows the user's keys.
+async function impioListKeys(chatId: number, store: Store, env: Env): Promise<void> {
+  let username = "";
+  try {
+    const acc = await store.getImpio(chatId);
+    username = acc.username;
+  } catch (e: any) {
+    await back(env, chatId, e.message);
+    return;
+  }
+  try {
+    const c = await getImpioSession(chatId, store);
+    const keys = await c.getKeys();
+    try {
+      await c.logout();
+    } catch {
+      // ignore
+    }
+    if (keys.length === 0) {
+      await back(env, chatId, `В аккаунте impio (${username}) нет ключей.`);
+      return;
+    }
+    let reply = `Ключи impio (${username}):\n`;
+    for (const k of keys) {
+      reply += `- #${k.id} ${k.name || ""} [${k.protocol_name || "?"}] ${k.location_name || ""}${k.is_connected ? " ● активен" : ""}\n`;
+    }
+    await back(env, chatId, reply);
+  } catch (e: any) {
+    await userError(env, "Не удалось получить ключи impio: " + e.message, undefined, chatId);
+  }
+}
+
+// impioPickRouterForSync shows the user's routers to pick where to apply a key.
+async function impioPickRouterForSync(chatId: number, store: Store, env: Env): Promise<void> {
+  const list = await store.list(chatId);
+  if (list.length === 0) {
+    await back(env, chatId, "Нет привязанных роутеров. Сначала «Привязать роутер».");
+    return;
+  }
+  const buttons = list.map((r) => ({
+    text: r.name,
+    callback_data: `iolet:${r.name}`,
+  }));
+  buttons.push({ text: "🏠 В начало", callback_data: "nav:main" });
+  await sendInlineKeyboard(
+    env.TG_BOT_TOKEN,
+    chatId,
+    "Выберите роутер, на который применить ключ impio (старые ключи будут очищены, новый станет основным интернетом):",
+    buttons
+  );
+}
+
+// impioSync is the command entry that asks for a router, or applies to the
+// selected router if only one is bound.
+async function impioSync(chatId: number, arg: string, store: Store, env: Env): Promise<void> {
+  const name = arg.trim();
+  if (name) {
+    try {
+      await store.get(chatId, name);
+    } catch (e: any) {
+      await back(env, chatId, e.message);
+      return;
+    }
+    await impioFetchAndApply(chatId, name, store, env);
+    return;
+  }
+  const list = await store.list(chatId);
+  if (list.length === 1) {
+    await impioFetchAndApply(chatId, list[0].name, store, env);
+    return;
+  }
+  await impioPickRouterForSync(chatId, store, env);
+}
+
+// impioFetchAndApply fetches the WireGuard key from impio and applies it to the
+// given router, reusing applyConf (which clears old keys, imports, enables and
+// makes the new key the primary internet).
+async function impioFetchAndApply(
+  chatId: number,
+  name: string,
+  store: Store,
+  env: Env
+): Promise<void> {
+  let bd: Binding;
+  try {
+    bd = await store.get(chatId, name);
+  } catch (e: any) {
+    await back(env, chatId, e.message);
+    return;
+  }
+
+  await back(env, chatId, "Забираю ключ из my.impio.space...");
+  let client: ImpioClient | undefined;
+  let config: Awaited<ReturnType<ImpioClient["getKeyConfig"]>> | undefined;
+  try {
+    // Whole impio flow (login -> keys -> config) is retried to ride out
+    // transient upstream unavailability before touching the router.
+    await retry(async () => {
+      const c = await getImpioSession(chatId, store);
+      const key = await c.pickWireGuardKey();
+      const cfg = await c.getKeyConfig(key.id);
+      client = c;
+      config = cfg;
+    }, 3, 2500);
+  } catch (e: any) {
+    await userError(env, "Не удалось получить ключ impio: " + e.message, undefined, chatId);
+    return;
+  }
+  if (!client || !config) {
+    await userError(env, "Не удалось получить ключ impio: пустой ответ.", undefined, chatId);
+    return;
+  }
+  try {
+    await client.logout();
+  } catch {
+    // ignore
+  }
+
+  const conf = config.content;
+  const fileName = config.filename || "impvpn.conf";
+  await applyConf(chatId, bd, fileName, conf, env, store);
+}
+
+// impioLogout removes the stored impio credentials.
+async function impioLogout(chatId: number, store: Store, env: Env): Promise<void> {
+  try {
+    await store.removeImpio(chatId);
+    await back(env, chatId, "Аккаунт impio отвязан.");
+  } catch (e: any) {
+    await back(env, chatId, e.message);
+  }
+}
+
+// ioConnectMenu is the entry to "Подключение ключа на роутере": a small menu with
+// a single "Подключить" button that starts the connect/replace flow.
+async function ioConnectMenu(chatId: number, store: Store, env: Env): Promise<void> {
+  await sendInlineKeyboard(
+    env.TG_BOT_TOKEN,
+    chatId,
+    "🔌 Подключение ключа на роутере.\n\nНажмите «Подключить», чтобы подключить ключ Impio к вашему роутеру.\n" +
+      "• если на роутере ещё нет ключа — выпустим новый и установим его\n" +
+      "• если ключ уже есть — выберете его в Impio, удалим и подменим новым",
+    [
+      { text: "✅ Подключить", callback_data: "iocrtr" },
+      { text: "🏠 В начало", callback_data: "nav:main" },
+    ]
+  );
+}
+
+// impioConnectPickRouterList asks which router to connect the key to.
+async function impioConnectPickRouterList(chatId: number, store: Store, env: Env): Promise<void> {
+  const list = await store.list(chatId);
+  if (list.length === 0) {
+    await back(env, chatId, "Нет привязанных роутеров — сначала привяжите роутер.");
+    return;
+  }
+  const buttons = list.map((r) => ({
+    text: r.name,
+    callback_data: `ioconn:${r.name}`,
+  }));
+  buttons.push({ text: "🏠 В начало", callback_data: "nav:main" });
+  await sendInlineKeyboard(
+    env.TG_BOT_TOKEN,
+    chatId,
+    "Выберите роутер, к которому подключить ключ:",
+    buttons
+  );
+}
+
+// impioConnectPickRouter is called after a router is selected. It checks whether
+// the router already has a WireGuard key, then branches:
+//   - key exists -> mode "replace": pick the old key to delete, then new location
+//   - no key     -> mode "create": pick the new location directly
+async function impioConnectPickRouter(chatId: number, router: string, store: Store, env: Env): Promise<void> {
+  let bd: Binding;
+  try {
+    bd = await store.get(chatId, router);
+  } catch (e: any) {
+    await back(env, chatId, e.message);
+    return;
+  }
+
+  await back(env, chatId, `Проверяю наличие ключа на роутере ${router}...`);
+  const c = new KeeneticClient(bd.url, bd.login, bd.password);
+  let alive = false;
+  try {
+    alive = await retry(() => c.ping(), 3, 3000);
+  } catch {
+    alive = false;
+  }
+  if (!alive) {
+    await userError(env, `Роутер ${router} недоступен.`, undefined, chatId);
+    return;
+  }
+  try {
+    await retry(() => c.auth(), 3, 3000);
+  } catch (e: any) {
+    await userError(env, "Авторизация на роутере не удалась: " + e.message, undefined, chatId);
+    return;
+  }
+
+  let ifaces: any[] = [];
+  try {
+    ifaces = await c.showWireGuardInterfaces();
+  } catch {
+    ifaces = [];
+  }
+  const hasKey = ifaces.length > 0;
+
+  await store.setImpioReplaceState(chatId, {
+    mode: hasKey ? "replace" : "create",
+    router,
+  });
+
+  // Ask which WireGuard protocol to use (available on impio).
+  await impioReplacePickProtocol(chatId, store, env);
+}
+
+// WireGuard-compatible protocols on impio (those giving a [Interface]/[Peer]
+// config compatible with Keenetic). type_vpn: 3 = WireGuard Xray, 4 = impWG,
+// 11 = AmneziaWG. Other types (1,6,10 = VLESS variants) are NOT Keenetic-compatible.
+const IMPIO_WG_PROTOCOLS: { type: number; name: string }[] = [
+  { type: 3, name: "WireGuard Xray" },
+  { type: 4, name: "impWG" },
+  { type: 11, name: "AmneziaWG" },
+];
+
+// impioReplacePickProtocol asks which WireGuard protocol to use. All three
+// supported protocols are shown; their per-location availability is verified
+// during execution (switch-location), because availability depends on location.
+async function impioReplacePickProtocol(chatId: number, store: Store, env: Env): Promise<void> {
+  const cur = (await store.getImpioReplaceState(chatId)) || {};
+  const buttons = IMPIO_WG_PROTOCOLS.map((p) => ({
+    text: p.name,
+    callback_data: `ioprot:${p.type}`,
+  }));
+  buttons.push({ text: "🏠 В начало", callback_data: "nav:main" });
+  await sendInlineKeyboard(
+    env.TG_BOT_TOKEN,
+    chatId,
+    `✅ Роутер: ${cur.router}\n\nВопрос протокола: какой WireGuard-протокол использовать?`,
+    buttons
+  );
+}
+
+// impioReplacePickProtocolDone saves the chosen protocol and continues: for
+// replace mode -> ask old key; for create mode -> ask location directly.
+async function impioReplacePickProtocolDone(chatId: number, typeVpn: number, store: Store, env: Env): Promise<void> {
+  const cur = (await store.getImpioReplaceState(chatId)) || {};
+  const proto = IMPIO_WG_PROTOCOLS.find((p) => p.type === typeVpn);
+  const protocolName = proto ? proto.name : `Тип ${typeVpn}`;
+  await store.setImpioReplaceState(chatId, { ...cur, protocolType: typeVpn, protocolName });
+
+  await impioReplacePickOldKey(chatId, cur.router || "", store, env);
+}
+
+// impioReplacePickOldKey saves the chosen router and, when the account has at
+// least one key, asks which existing key on the service to replace (the one that
+// will be deleted after the new key installs). A "Create new" button is always
+// available instead. If the account has no keys, this step is skipped and we go
+// straight to creating a fresh key.
+async function impioReplacePickOldKey(chatId: number, router: string, store: Store, env: Env): Promise<void> {
+  await store.setImpioReplaceState(chatId, { router, ...(await store.getImpioReplaceState(chatId) || {}) });
+
+  await sendInlineKeyboard(
+    env.TG_BOT_TOKEN,
+    chatId,
+    "Загрузка списка ключей...",
+    [{ text: "🏠 В начало", callback_data: "nav:main" }]
+  );
+  let c: ImpioClient | undefined;
+  try {
+    c = await getImpioSession(chatId, store);
+    const keys = await c.getKeys();
+    await c.logout().catch(() => {});
+    if (keys.length === 0) {
+      // No keys on impio — skip replacement, go straight to creating a new one.
+      await impioReplacePickLocation(chatId, 0, store, env, true);
+      return;
+    }
+    const buttons = keys.map((k) => ({
+      text: `#${k.id} ${k.name || ""} [${k.location_name || "?"}]${
+        (k as any).tariff_plan ? " (" + (k as any).tariff_plan + ")" : ""
+      }`,
+      callback_data: `ioreplk:${k.id}`,
+    }));
+    buttons.push({ text: "🆕 Создать новый", callback_data: "ioreplnew" });
+    buttons.push({ text: "🏠 В начало", callback_data: "nav:main" });
+    await sendInlineKeyboard(
+      env.TG_BOT_TOKEN,
+      chatId,
+      `🔌 На роутере ${router} подключим ключ Impio.\n\nВыберите, какой ключ на my.impio.space заменить (он будет удалён после установки нового), либо создайте новый:`,
+      buttons
+    );
+  } catch (e: any) {
+    try { c?.logout().catch(() => {}); } catch {}
+    await userError(env, "Не удалось получить ключи impio: " + e.message, undefined, chatId);
+  }
+}
+
+// impioReplacePickLocation saves the old key (if replacing) and asks which
+// location the new key should use. createOnly=true means there is no old key and
+// no existing VPN on the router (we just issue and apply a fresh one).
+async function impioReplacePickLocation(chatId: number, oldKeyId: number, store: Store, env: Env, createOnly = false): Promise<void> {
+  const cur = (await store.getImpioReplaceState(chatId)) || {};
+  const next: any = { ...cur };
+  if (!createOnly) {
+    next.oldKeyId = oldKeyId;
+    next.mode = "replace";
+  } else {
+    next.mode = "create";
+    delete next.oldKeyId;
+  }
+  await store.setImpioReplaceState(chatId, next);
+
+  let c: ImpioClient | undefined;
+  try {
+    c = await getImpioSession(chatId, store);
+    const locs = await c.getLocations(cur.protocolType);
+    await c.logout().catch(() => {});
+    const usable = locs.filter((l) => l.work !== false);
+    if (usable.length === 0) {
+      await store.deleteImpioReplaceState(chatId);
+      await back(env, chatId, "Нет доступных локаций для выбранного протокола на сервисе.");
+      return;
+    }
+    const buttons = usable.map((l) => ({
+      text: l.server_count ? `${l.name} (${l.server_count})` : l.name,
+      callback_data: `iorepll:${l.id}`,
+    }));
+    buttons.push({ text: "🏠 В начало", callback_data: "nav:main" });
+    const head = createOnly
+      ? `✅ Роутер: ${cur.router}\n🔌 Протокол: ${cur.protocolName || "?"}\n🔑 Создаём новый ключ.\n\nВ какую локацию выпустить новый ключ? (серверы: ${cur.protocolName || "?"})`
+      : `✅ Роутер: ${cur.router}\n🔌 Протокол: ${cur.protocolName || "?"}\n✅ Старый ключ: #${oldKeyId}\n\nВ какую локацию создать новый ключ? (серверы: ${cur.protocolName || "?"})`;
+    await sendInlineKeyboard(env.TG_BOT_TOKEN, chatId, head, buttons);
+  } catch (e: any) {
+    try { c?.logout().catch(() => {}); } catch {}
+    await userError(env, "Не удалось получить локации impio: " + e.message, undefined, chatId);
+  }
+}
+
+// impioReplaceConfirm saves the location and shows the final confirmation with
+// the single "Выполнить" button.
+async function impioReplaceConfirm(chatId: number, locationId: string, store: Store, env: Env): Promise<void> {
+  let c: ImpioClient | undefined;
+  let locationName = locationId;
+  try {
+    c = await getImpioSession(chatId, store);
+    const cur0 = (await store.getImpioReplaceState(chatId)) || {};
+    const locs = await c.getLocations(cur0.protocolType);
+    const loc = locs.find((l) => String(l.id) === String(locationId));
+    if (loc) locationName = loc.name;
+    await c.logout().catch(() => {});
+  } catch (e: any) {
+    try { c?.logout().catch(() => {}); } catch {}
+    await userError(env, "Не удалось получить локации impio: " + e.message, undefined, chatId);
+    return;
+  }
+
+  const cur = (await store.getImpioReplaceState(chatId)) || {};
+  await store.setImpioReplaceState(chatId, { ...cur, locationId, locationName });
+  const mode = cur.mode || (cur.oldKeyId ? "replace" : "create");
+
+  let summary = `Проверьте выбор перед выполнением:\n\n`;
+  if (mode === "replace") {
+    summary +=
+      `📡 Роутер: ${cur.router}\n` +
+      `🔌 Протокол: ${cur.protocolName || "?"}\n` +
+      `🗑 Старый ключ Impio: #${cur.oldKeyId} (удалим)\n` +
+      `📍 Новая локация: ${locationName}\n\n` +
+      `Нажмите «Выполнить» — и бот поочерёдно:\n` +
+      `1) создаст новый ключ на my.impio.space (имя: роутер)\n` +
+      `2) переключит его в локацию ${locationName} (протокол ${cur.protocolName || "?"})\n` +
+      `3) удалит старый ключ #${cur.oldKeyId}\n` +
+      `4) подменит ключ на роутере ${cur.router}`;
+  } else {
+    summary +=
+      `📡 Роутер: ${cur.router}\n` +
+      `🔌 Протокол: ${cur.protocolName || "?"}\n` +
+      `📍 Новая локация: ${locationName}\n\n` +
+      `Нажмите «Выполнить» — и бот поочерёдно:\n` +
+      `1) выпустит новый ключ на my.impio.space (имя: роутер)\n` +
+      `2) переключит его в локацию ${locationName} (протокол ${cur.protocolName || "?"})\n` +
+      `3) установит ключ на роутер ${cur.router}`;
+  }
+
+  await sendInlineKeyboard(
+    env.TG_BOT_TOKEN,
+    chatId,
+    summary,
+    [
+      { text: "✅ Выполнить", callback_data: "ioreplexec" },
+      { text: "🏠 В начало", callback_data: "nav:main" },
+    ]
+  );
+}
+
+// impioReplaceExecute runs all replace operations sequentially.
+async function impioReplaceExecute(chatId: number, store: Store, env: Env): Promise<void> {
+  const st = await store.getImpioReplaceState(chatId);
+  if (!st || !st.router || !st.locationId) {
+    await back(env, chatId, "Данные подключения ключа утеряны — начните заново.");
+    return;
+  }
+  const router = st.router;
+  const mode = st.mode === "create" ? "create" : "replace";
+  const oldKeyId = st.oldKeyId;
+  const locationIdStr = st.locationId;
+  const locationName = st.locationName || st.locationId;
+  // New key name = start of the router address/name: either the first 10 chars,
+  // or everything up to the first dot if that dot comes before the 10th char.
+  const keyNameRaw = router.replace(/\s+/g, "");
+  const keyDot = keyNameRaw.indexOf(".");
+  let keyName: string;
+  if (keyDot !== -1 && keyDot < 10) keyName = keyNameRaw.slice(0, keyDot);
+  else keyName = keyNameRaw.slice(0, 10);
+  keyName = keyName || "router";
+
+  let bd: Binding;
+  try {
+    bd = await store.get(chatId, router);
+  } catch (e: any) {
+    await store.deleteImpioReplaceState(chatId);
+    await back(env, chatId, e.message);
+    return;
+  }
+
+  let c: ImpioClient | undefined;
+  try {
+    c = await getImpioSession(chatId, store);
+
+    await sendInlineKeyboard(
+      env.TG_BOT_TOKEN,
+      chatId,
+      `⏳ Шаг 1/${mode === "replace" ? 4 : 3} — выпускаю новый ключ «${keyName}» на my.impio.space...`,
+      [{ text: "🏠 В начало", callback_data: "nav:main" }]
+    );
+
+    // Determine tariff from the old key when replacing, otherwise default "format".
+    let tariff = "format";
+    if (mode === "replace" && oldKeyId) {
+      const keys = await c.getKeys();
+      const old = keys.find((k) => String(k.id) === String(oldKeyId));
+      if (old && (old as any).tariff_plan) tariff = (old as any).tariff_plan;
+    }
+    let newKeyId: number;
+    try {
+      newKeyId = await c.createKey(tariff, { name: keyName });
+    } catch {
+      // Some API versions reject the extra "name" field; retry without it.
+      newKeyId = await c.createKey(tariff);
+    }
+
+    await sendInlineKeyboard(
+      env.TG_BOT_TOKEN,
+      chatId,
+      `✅ Ключ №${newKeyId} («${keyName}») выпущен.\n⏳ Шаг 2/${mode === "replace" ? 4 : 3} — переключаю в локацию ${locationName}...`,
+      [{ text: "🏠 В начало", callback_data: "nav:main" }]
+    );
+
+    // File name pieces: key #, protocol, location (emberly; no emoji in it).
+    const sfProto = (st.protocolName || (st.protocolType ? "wg" + st.protocolType : "wg"))
+      .replace(/[^a-zA-Z0-9_-]+/g, "").slice(0, 12) || "wg";
+    const sfLoc = String(locationName || "")
+      .replace(/[^a-zA-Z0-9а-яА-ЯёЁ_-]+/g, "").slice(0, 12) || "loc";
+
+    const protocolTypes = st.protocolType ? [st.protocolType] : [4, 11];
+
+    // Try to get a usable config for the current key. Returns null when no
+    // server/config is available for the chosen location+protocol.
+    const obtainConfig = async (keyId: number): Promise<string | null> => {
+      let serverId: number | string | undefined;
+      for (const tv of protocolTypes) {
+        const servers = (await c!.getServers(locationIdStr, tv, keyId).catch(() => [])) as import("./impio.js").ImpioServer[];
+        if (!servers.length) continue;
+        const sorted = [...servers]
+          .filter((s) => s.work !== false)
+          .sort((a, b) => (a.load_percentage ?? 0) - (b.load_percentage ?? 0));
+        for (const s of sorted) {
+          try {
+            const cfg = await c!.switchLocation(keyId, s.id, locationName);
+            serverId = s.id;
+            if (cfg && cfg.content) return cfg.content;
+          } catch {
+            // this server/location failed -> try the next one
+          }
+        }
+        if (serverId) return null;
+      }
+      return null;
+    };
+
+    // First pass: use the already-created key. If the config turns out broken
+    // (Keenetic can't import it: "unable to find private key", no interface,
+    // empty config), release a fresh key and retry — up to MAX_INSTALL_ATTEMPTS.
+    // The old key (replace mode) is deleted only AFTER a successful install.
+    const MAX_INSTALL_ATTEMPTS = 3;
+    let installed = false;
+    let lastErr = "";
+    let cfgContent: string | null = await obtainConfig(newKeyId);
+    if (!cfgContent) {
+      // No server/config for this location+protocol — offer another choice.
+      try { await c!.deleteKey(newKeyId); } catch {}
+      if (st.protocolType) {
+        await askLocationAgainPreserving(chatId, store, env,
+          `❗ В локации «${locationName}» протокол ${st.protocolName || st.protocolType} сейчас недоступен (нет свободных серверов).\n\n` +
+          (mode === "replace" ? `Старый ключ #${oldKeyId} не тронут. ` : `Новый ключ не выпущен. `) +
+          `Выберите другую локацию или протокол:`,
+          mode === "replace" ? (oldKeyId ?? 0) : 0, true);
+      } else {
+        await askLocationAgainPreserving(chatId, store, env,
+          `❗ Переход в локацию «${locationName}» сейчас невозможен (серверы перегружены или недоступны).\n\n` +
+          (mode === "replace" ? `Старый ключ #${oldKeyId} не тронут. ` : `Новый ключ не выпущен. `) +
+          `Выберите, пожалуйста, другую локацию:`,
+          mode === "replace" ? (oldKeyId ?? 0) : 0);
+      }
+      return;
+    }
+
+    for (let attempt = 1; attempt <= MAX_INSTALL_ATTEMPTS && !installed; attempt++) {
+      if (attempt > 1) {
+        // The config was broken / router rejected the current key — new key.
+        try { if (newKeyId) await c.deleteKey(newKeyId); } catch {}
+        try {
+          newKeyId = await c.createKey(tariff, { name: keyName });
+        } catch {
+          newKeyId = await c.createKey(tariff);
+        }
+        await sendInlineKeyboard(
+          env.TG_BOT_TOKEN,
+          chatId,
+          `🔄 Ключ №${newKeyId} («${keyName}») не встал на роутер — выпустил новый.\n⏳ Переключаю новый ключ в локацию ${locationName}...`,
+          [{ text: "🏠 В начало", callback_data: "nav:main" }]
+        );
+        cfgContent = await obtainConfig(newKeyId);
+        if (!cfgContent) {
+          lastErr = `ключ №${newKeyId} не дал рабочий конфиг в локации «${locationName}»`;
+          continue;
+        }
+      }
+
+      await sendInlineKeyboard(
+        env.TG_BOT_TOKEN,
+        chatId,
+        `⏳ Устанавливаю ключ №${newKeyId} на роутер ${router}...`,
+        [{ text: "🏠 В начало", callback_data: "nav:main" }]
+      );
+      const fileName = `imp-${newKeyId}-${sfProto}-${sfLoc}.conf`;
+      const res = await applyConf(chatId, bd, fileName, cfgContent!, env, store, false);
+      if (res.ok) {
+        installed = true;
+      } else {
+        lastErr = res.message;
+        if (!res.retryable) break;
+      }
+    }
+
+    if (!installed) {
+      // Clean up the freshly created (unused) key.
+      try { if (newKeyId) await c.deleteKey(newKeyId); } catch {}
+      try { await c.logout(); } catch {}
+      await userError(env, `Не удалось установить ключ на роутер ${router}${lastErr ? `: ${lastErr}` : ""}.`, undefined, chatId);
+      return;
+    }
+
+    // Installed OK — now (replace mode) delete the old key.
+    if (mode === "replace" && oldKeyId) {
+      await sendInlineKeyboard(
+        env.TG_BOT_TOKEN,
+        chatId,
+        `✅ Ключ №${newKeyId} установлен на роутер ${router}.\n🗑 Удаляю старый ключ #${oldKeyId}...`,
+        [{ text: "🏠 В начало", callback_data: "nav:main" }]
+      );
+      try {
+        await c.deleteKey(oldKeyId);
+        await sendInlineKeyboard(env.TG_BOT_TOKEN, chatId, `✅ Старый ключ #${oldKeyId} удалён.`, [{ text: "🏠 В начало", callback_data: "nav:main" }]);
+      } catch (e: any) {
+        await userError(env, `Ключ №${newKeyId} установлен, но не удалось удалить старый #${oldKeyId}: ${e.message}`, undefined, chatId);
+      }
+    }
+    try { await c.logout(); } catch {}
+    await store.deleteImpioReplaceState(chatId);
+  } catch (e: any) {
+    try { c?.logout().catch(() => {}); } catch {}
+    await userError(env, "Не удалось подключить ключ impio: " + e.message, undefined, chatId);
+  }
+}
+
+// askLocationAgainPreserving re-offers the location list after a switch failure,
+// keeping the already-chosen router (and old key, when replacing) in state.
+// When offerProtocol is true, an extra "change protocol" button is shown.
+async function askLocationAgainPreserving(chatId: number, store: Store, env: Env, msg: string, oldKeyId: number, offerProtocol = false): Promise<void> {
+  const cur = (await store.getImpioReplaceState(chatId)) || {};
+  const next: any = { ...cur, locationId: undefined, locationName: undefined };
+  if (oldKeyId > 0) {
+    next.oldKeyId = oldKeyId;
+    next.mode = "replace";
+  } else {
+    delete next.oldKeyId;
+    next.mode = "create";
+  }
+  await store.setImpioReplaceState(chatId, next);
+  let c: ImpioClient | undefined;
+  try {
+    c = await getImpioSession(chatId, store);
+    const cur0 = (await store.getImpioReplaceState(chatId)) || {};
+    const locs = await c.getLocations(cur0.protocolType);
+    await c.logout().catch(() => {});
+    const usable = locs.filter((l) => l.work !== false);
+    const buttons = usable.map((l) => ({
+      text: l.server_count ? `${l.name} (${l.server_count})` : l.name,
+      callback_data: `iorepll:${l.id}`,
+    }));
+    if (offerProtocol) {
+      buttons.push({ text: "🔌 Сменить протокол", callback_data: "ioprotret" });
+    }
+    buttons.push({ text: "🏠 В начало", callback_data: "nav:main" });
+    await sendInlineKeyboard(env.TG_BOT_TOKEN, chatId, msg, buttons);
+  } catch (e: any) {
+    try { c?.logout().catch(() => {}); } catch {}
+    await userError(env, "Не удалось получить локации impio: " + e.message, undefined, chatId);
+  }
+}
+
+

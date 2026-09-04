@@ -16,6 +16,36 @@ export interface BindState {
   interface_id?: string;
 }
 
+// Impio (my.impio.space) account credentials bound to a chat, stored the same
+// way as router bindings (plaintext in KV, analogous to Binding.password).
+export interface ImpioAccount {
+  chat_id: number;
+  username: string;
+  password: string;
+}
+
+// Multi-step state for authorizing to impio (like router bind).
+export interface ImpioBindState {
+  step: number;
+  username?: string;
+  password?: string;
+  two_factor_token?: string;
+}
+
+// Multi-step state for the "replace key" flow: collect router + old key +
+// new location first, then execute all operations on a final "Выполнить" tap.
+// mode: "create" = no key on router yet (just issue+apply); "replace" = the
+// router already has a key, so we also delete a chosen old key and swap.
+export interface ImpioReplaceState {
+  mode?: "create" | "replace";
+  router?: string;
+  protocolType?: number;
+  protocolName?: string;
+  oldKeyId?: number;
+  locationId?: string;
+  locationName?: string;
+}
+
 export interface WireGuardInterface {
   id: string;
   type: string;

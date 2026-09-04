@@ -1,4 +1,4 @@
-import type { Binding, BindState } from "./types.js";
+import type { Binding, BindState, ImpioAccount, ImpioBindState, ImpioReplaceState } from "./types.js";
 
 export class Store {
   private kv: KVNamespace;
@@ -97,5 +97,70 @@ export class Store {
 
   async deleteSelected(chatId: number): Promise<void> {
     await this.kv.delete(`sel:${chatId}`);
+  }
+
+  // --- Impio (my.impio.space) account credentials ---
+  private impioKey(chatId: number): string {
+    return `impio:${chatId}`;
+  }
+
+  async addImpio(a: ImpioAccount): Promise<void> {
+    const existing = await this.kv.get(this.impioKey(a.chat_id));
+    if (existing) throw new Error("Аккаунт impio уже сохранён: сначала выйдите из текущего.");
+    await this.kv.put(this.impioKey(a.chat_id), JSON.stringify(a));
+  }
+
+  async updateImpio(a: ImpioAccount): Promise<void> {
+    const existing = await this.kv.get(this.impioKey(a.chat_id));
+    if (!existing) throw new Error("Аккаунт impio не найден.");
+    await this.kv.put(this.impioKey(a.chat_id), JSON.stringify(a));
+  }
+
+  async getImpio(chatId: number): Promise<ImpioAccount> {
+    const data = await this.kv.get(this.impioKey(chatId));
+    if (!data) throw new Error("Аккаунт impio не привязан. Сначала авторизуйтесь на my.impio.space.");
+    return JSON.parse(data);
+  }
+
+  async hasImpio(chatId: number): Promise<boolean> {
+    return !!(await this.kv.get(this.impioKey(chatId)));
+  }
+
+  async removeImpio(chatId: number): Promise<void> {
+    const existing = await this.kv.get(this.impioKey(chatId));
+    if (!existing) throw new Error("Аккаунт impio не найден.");
+    await this.kv.delete(this.impioKey(chatId));
+  }
+
+  // Impio bind state (multi-step authorization)
+  async getImpioBindState(chatId: number): Promise<ImpioBindState | null> {
+    const data = await this.kv.get(`iobind:${chatId}`);
+    return data ? JSON.parse(data) : null;
+  }
+
+  async setImpioBindState(chatId: number, state: ImpioBindState): Promise<void> {
+    await this.kv.put(`iobind:${chatId}`, JSON.stringify(state), {
+      expirationTtl: 600, // 10 minutes
+    });
+  }
+
+  async deleteImpioBindState(chatId: number): Promise<void> {
+    await this.kv.delete(`iobind:${chatId}`);
+  }
+
+  // Impio replace-key multi-step state
+  async getImpioReplaceState(chatId: number): Promise<ImpioReplaceState | null> {
+    const data = await this.kv.get(`iorepl:${chatId}`);
+    return data ? JSON.parse(data) : null;
+  }
+
+  async setImpioReplaceState(chatId: number, state: ImpioReplaceState): Promise<void> {
+    await this.kv.put(`iorepl:${chatId}`, JSON.stringify(state), {
+      expirationTtl: 900, // 15 minutes
+    });
+  }
+
+  async deleteImpioReplaceState(chatId: number): Promise<void> {
+    await this.kv.delete(`iorepl:${chatId}`);
   }
 }

@@ -1,6 +1,35 @@
 import { md5hex, sha256hex } from "./md5.js";
 import type { AscParams, PeerParams, WireGuardInterface } from "./types.js";
 
+async function resolveViaDoH(hostname: string): Promise<string[]> {
+  // Try Google DoH first (different IP pool than Cloudflare's own DNS)
+  const providers = [
+    "https://dns.google/resolve",
+    "https://cloudflare-dns.com/dns-query",
+  ];
+  for (const base of providers) {
+    try {
+      const resp = await fetch(
+        `${base}?name=${encodeURIComponent(hostname)}&type=A`,
+        {
+          headers: { Accept: "application/dns-json" },
+          signal: AbortSignal.timeout(5000),
+        },
+      );
+      const data = (await resp.json()) as {
+        Answer?: { data: string; type?: number }[];
+      };
+      const ips = (data.Answer || [])
+        .filter((a) => !a.type || a.type === 1)
+        .map((a) => a.data);
+      if (ips.length > 0) return ips;
+    } catch {
+      // Try next provider
+    }
+  }
+  return [];
+}
+
 export class KeeneticClient {
   private baseURL: string;
   private alternateBaseURL?: string;
@@ -30,6 +59,21 @@ export class KeeneticClient {
 
   async ping(): Promise<boolean> {
     if (await this.tryPing(this.baseURL)) return true;
+    // Try DoH-resolved IPs with SNI override
+    const hostname = this.baseURL.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+    const ips = await resolveViaDoH(hostname);
+    for (const ip of ips) {
+      try {
+        const resp = await fetch(`https://${ip}/rci/show/version`, {
+          headers: { Host: hostname },
+          cf: { connect: { servername: hostname } },
+          signal: AbortSignal.timeout(15000),
+        });
+        if (resp.status === 200 || resp.status === 401) return true;
+      } catch {
+        // IP failed
+      }
+    }
     if (this.alternateBaseURL) return this.tryPing(this.alternateBaseURL);
     return false;
   }
@@ -48,15 +92,69 @@ export class KeeneticClient {
   // fetchBase requests against the primary (https) base, falling back to the
   // alternate (http) base only on network-level failures. It never falls back
   // on HTTP error statuses, so Keenetic's auth rejects are preserved.
+  // When the primary URL returns 503 "Not Reachable" (netcraze tunnel issue),
+  // it attempts a DoH-resolved IP fallback with proper SNI via cf.connect.
   private async fetchBase(path: string, init?: RequestInit): Promise<Response> {
+    const url = `${this.baseURL}${path}`;
+    let resp: Response;
     try {
-      return await fetch(`${this.baseURL}${path}`, init);
+      resp = await fetch(url, init);
     } catch (e) {
+      // Network-level failure: try alternate (http) base
       if (this.alternateBaseURL && this.alternateBaseURL !== this.baseURL) {
         return await fetch(`${this.alternateBaseURL}${path}`, init);
       }
       throw e;
     }
+
+    // Check for netcraze tunnel "Not Reachable" — fall back to DoH IP resolution
+    const xDetail = resp.headers.get("x-detail") || "";
+    if (resp.status === 503 && /not reachable/i.test(xDetail)) {
+      const hostname = this.baseURL.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+      const altIp = await this.tryDoHFallback(hostname, path, init);
+      if (altIp) return altIp;
+    }
+
+    return resp;
+  }
+
+  // Attempt to reach the router via DoH-resolved IPs using cf.connect for
+  // proper SNI and Host header override. Returns the first successful response.
+  private async tryDoHFallback(
+    hostname: string,
+    path: string,
+    init?: RequestInit,
+  ): Promise<Response | null> {
+    const ips = await resolveViaDoH(hostname);
+    for (const ip of ips) {
+      try {
+        const resp = await fetch(`https://${ip}${path}`, {
+          ...init,
+          headers: {
+            ...(init?.headers || {}),
+            Host: hostname,
+          },
+          cf: { connect: { servername: hostname } },
+          signal: AbortSignal.timeout(15000),
+        });
+        // If we get a response that isn't a netcraze error, use it
+        const detail = resp.headers.get("x-detail") || "";
+        if (resp.status !== 503 || !/not reachable/i.test(detail)) {
+          return resp;
+        }
+      } catch {
+        // IP failed, try next
+      }
+    }
+    // If all DoH IPs fail, try HTTP alternate as last resort
+    if (this.alternateBaseURL && this.alternateBaseURL !== this.baseURL) {
+      try {
+        return await fetch(`${this.alternateBaseURL}${path}`, init);
+      } catch {
+        // Give up
+      }
+    }
+    return null;
   }
 
   async auth(): Promise<void> {
@@ -161,6 +259,13 @@ export class KeeneticClient {
   }
 
   private checkError(data: any): void {
+    if (data && typeof data === "object" && Array.isArray(data.status)) {
+      for (const s of data.status) {
+        if (s && s.status === "error") {
+          throw new Error(`RCI error: ${s.message} (${s.code}) ${s.ident || ""}`);
+        }
+      }
+    }
     if (!Array.isArray(data)) return;
     for (const r of data) {
       const statuses = r?.parse?.status;
@@ -232,14 +337,19 @@ export class KeeneticClient {
     }
   }
 
-  // setGlobalPriority marks an interface as a global (internet) provider at a
+  // setGlobalPriority marks an interface as a global (internet) provider with a
   // given priority. Lower priority number = higher route preference among the
   // router's "Connection priorities" (failover/balance). order is the tie-break.
-  async setGlobalPriority(id: string, priority: number, order: number): Promise<void> {
+  // NOTE: the CLI command `interface <id> ip global <N>` is the reliable way to
+  // set this; the RCI POST (ip.global.priority) is ignored by Keenetic and the
+  // priority stays unchanged, so we use the CLI command instead.
+  async setGlobalPriority(id: string, priority: number, order = 0): Promise<void> {
+    let cmd = `interface ${id} ip global ${priority}`;
+    if (order) cmd += ` order ${order}`;
     const { data, status } = await this.do(
       "POST",
-      `/rci/interface/${id}`,
-      { ip: { global: { priority, order } } },
+      "/rci/",
+      [{ parse: cmd }],
       "application/json"
     );
     if (status < 200 || status > 299) {
@@ -265,6 +375,62 @@ export class KeeneticClient {
       throw new Error(`CLI '${cmd}' failed (status ${status})`);
     }
     return data;
+  }
+
+  // enableInVpnPolicy makes the given interface the FIRST permitted connection of
+  // the "VPN" connection policy (see UI "Connection Policies"). This is what the
+  // VPN policy checkbox does: it must be checked for the VPN interface and it
+  // must appear at the top (first place) of that policy. Other already-permitted
+  // connections are kept (Redundancy/failover), just moved after this one.
+  // The target policy is found by its description "VPN"; falls back to Policy0.
+  async enableInVpnPolicy(interfaceId: string): Promise<void> {
+    // 1) Find policies
+    const { data: policies, status: polStatus } = await this.do("GET", "/rci/ip/policy");
+    if (polStatus < 200 || polStatus > 299) {
+      throw new Error(`Read policies failed (status ${polStatus})`);
+    }
+    let polName: string | null = null;
+    if (policies && typeof policies === "object") {
+      for (const [name, pol] of Object.entries(policies as Record<string, any>)) {
+        const desc = (pol?.description || "").toString().toLowerCase();
+        if (desc === "vpn" || desc.includes("vpn")) { polName = name; break; }
+      }
+      if (!polName && (policies as any).Policy0) polName = "Policy0";
+    }
+    if (!polName) throw new Error("Не найдена политика VPN (ip policy).");
+
+    // 2) Read current permitted connections of that policy
+    const { data: curData } = await this.do("GET", `/rci/ip/policy/${polName}`);
+    const curPermit: { interface: string; enabled?: boolean; no?: boolean }[] =
+      Array.isArray(curData?.permit) ? curData.permit : [];
+
+    // 3) Build new permit list: target first (enabled), all others kept.
+    const others = curPermit.filter((p) => (p.interface || "") !== interfaceId);
+    const newPermit: { interface: string; enabled: boolean }[] = [
+      { interface: interfaceId, enabled: true },
+    ];
+    for (const o of others) {
+      // keep entries that were enabled; drop explicit "no" disables for others
+      if (o.no) continue;
+      newPermit.push({ interface: o.interface, enabled: o.enabled !== false });
+    }
+
+    // 4) Apply
+    const { data, status } = await this.do(
+      "POST",
+      `/rci/ip/policy/${polName}`,
+      { permit: newPermit },
+      "application/json"
+    );
+    if (status < 200 || status > 299) {
+      throw new Error(`Set policy ${polName} failed (status ${status}): ${JSON.stringify(data)}`);
+    }
+    this.checkError(data);
+    try {
+      await this.do("POST", "/rci/", [{ parse: "system configuration save" }], "application/json");
+    } catch {
+      // saving is optional
+    }
   }
 
   // wireGuardInterfaceIDs returns just the IDs of all WireGuard interfaces.
